@@ -52,6 +52,7 @@
 #include "core/prometheus.hh"
 #include "message/messaging_service.hh"
 #include <seastar/net/dns.hh>
+#include "service/cache_hitrate_calculator.hh"
 
 thread_local disk_error_signal_type commit_error;
 thread_local disk_error_signal_type general_disk_error;
@@ -300,6 +301,7 @@ int main(int ac, char** av) {
         ;
 
     distributed<database> db;
+    seastar::sharded<service::cache_hitrate_calculator> cf_cache_hitrate_calculator;
     debug::db = &db;
     auto& qp = cql3::get_query_processor();
     auto& proxy = service::get_storage_proxy();
@@ -342,7 +344,7 @@ int main(int ac, char** av) {
 
         tcp_syncookies_sanity();
 
-        return seastar::async([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs, &pctx, &prometheus_server, &return_value] {
+        return seastar::async([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs, &pctx, &prometheus_server, &return_value, &cf_cache_hitrate_calculator] {
             read_config(opts, *cfg).get();
             apply_logger_settings(cfg->default_log_level(), cfg->logger_log_level(),
                     cfg->log_to_stdout(), cfg->log_to_syslog());
@@ -610,6 +612,10 @@ int main(int ac, char** av) {
             engine().at_exit([lb = std::move(lb)] () mutable { return lb->stop_broadcasting(); });
             gms::get_local_gossiper().wait_for_gossip_to_settle().get();
             api::set_server_gossip_settle(ctx).get();
+            supervisor::notify("starting cf cache hit rate calculator");
+            cf_cache_hitrate_calculator.start(std::ref(db), std::ref(cf_cache_hitrate_calculator)).get();
+            engine().at_exit([&cf_cache_hitrate_calculator] { return cf_cache_hitrate_calculator.stop(); });
+            cf_cache_hitrate_calculator.local().run_on(engine().cpu_id());
             supervisor::notify("starting native transport");
             service::get_local_storage_service().start_native_transport().get();
             if (start_thrift) {
