@@ -3643,3 +3643,18 @@ future<> column_family::push_view_replica_updates(const schema_ptr& base, mutati
         db::view::mutate_MV(std::move(base_token), std::move(updates));
     });
 }
+
+void column_family::set_hit_rate(gms::inet_address addr, cache_temperature rate) {
+    auto& e = _cluster_cache_hit_rates[addr];
+    e.rate = rate;
+    e.last_updated = lowres_clock::now();
+}
+
+column_family::cache_hit_rate column_family::get_hit_rate(gms::inet_address addr) {
+    auto it = _cluster_cache_hit_rates.find(addr);
+    if (it == _cluster_cache_hit_rates.end()) {
+        return cache_hit_rate {cache_temperature(0.0f), lowres_clock::now()};
+    } else {
+        return it->second;
+    }
+}
