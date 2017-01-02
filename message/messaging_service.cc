@@ -210,6 +210,10 @@ const uint64_t* messaging_service::get_dropped_messages() const {
     return _dropped_messages;
 }
 
+void messaging_service::register_connection_drop_notifier(std::function<void(gms::inet_address ep)> cb) {
+    _connection_drop_notifiers.push_back(std::move(cb));
+}
+
 int32_t messaging_service::get_raw_version(const gms::inet_address& endpoint) const {
     // FIXME: messaging service versioning
     return current_version;
@@ -509,14 +513,15 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
     return it->second.rpc_client;
 }
 
-void messaging_service::remove_rpc_client_one(clients_map& clients, msg_addr id, bool dead_only) {
+bool messaging_service::remove_rpc_client_one(clients_map& clients, msg_addr id, bool dead_only) {
     if (_stopping) {
         // if messaging service is in a processed of been stopped no need to
         // stop and remove connection here since they are being stopped already
         // and we'll just interfere
-        return;
+        return false;
     }
 
+    bool found = false;
     auto it = clients.find(id);
     if (it != clients.end() && (!dead_only || it->second.rpc_client->error())) {
         auto client = std::move(it->second.rpc_client);
@@ -530,11 +535,17 @@ void messaging_service::remove_rpc_client_one(clients_map& clients, msg_addr id,
         client->stop().finally([id, client, ms = shared_from_this()] {
             logger.debug("dropped connection to {}", id.addr);
         }).discard_result();
+        found = true;
     }
+    return found;
 }
 
 void messaging_service::remove_error_rpc_client(messaging_verb verb, msg_addr id) {
-    remove_rpc_client_one(_clients[get_rpc_client_idx(verb)], id, true);
+    if (remove_rpc_client_one(_clients[get_rpc_client_idx(verb)], id, true)) {
+        for (auto&& cb : _connection_drop_notifiers) {
+            cb(id.addr);
+        }
+    }
 }
 
 void messaging_service::remove_rpc_client(msg_addr id) {
