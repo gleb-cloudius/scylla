@@ -391,6 +391,18 @@ struct cf_stats {
     int64_t surviving_sstables_after_clustering_filter = 0;
 };
 
+class cache_temperature {
+    float hit_rate;
+public:
+    uint8_t get_serialized_temperature() const {
+        return hit_rate * 255;
+    }
+    cache_temperature() : hit_rate(0) {}
+    explicit cache_temperature(float hr) : hit_rate(hr) {}
+    explicit cache_temperature(uint8_t hr) : hit_rate(hr/255.0f) {}
+    explicit operator float() const { return hit_rate; }
+};
+
 class column_family {
 public:
     struct config {
