@@ -43,6 +43,7 @@
 
 #include <boost/range/algorithm/stable_partition.hpp>
 #include <boost/range/algorithm/find.hpp>
+#include <boost/range/algorithm/transform.hpp>
 #include "exceptions/exceptions.hh"
 #include "core/sstring.hh"
 #include "schema.hh"
@@ -155,47 +156,169 @@ std::vector<gms::inet_address>
 filter_for_query(consistency_level cl,
                  keyspace& ks,
                  std::vector<gms::inet_address> live_endpoints,
-                 read_repair_decision read_repair, gms::inet_address* extra) {
-    size_t local_ep_count = live_endpoints.size();
-    size_t bf;
+                 read_repair_decision read_repair, gms::inet_address* extra, column_family* cf) {
+    size_t local_count;
 
-    /*
-     * Endpoints are expected to be restricted to live replicas, sorted by
-     * snitch preference. For LOCAL_QUORUM, move local-DC replicas in front
-     * first as we need them there whether we do read repair (since the first
-     * replica gets the data read) or not (since we'll take the block_for first
-     * ones).
-     */
-    if (is_datacenter_local(cl) || read_repair == read_repair_decision::DC_LOCAL) {
+    if (read_repair == read_repair_decision::GLOBAL) { // take RRD.GLOBAL out of the way
+        return std::move(live_endpoints);
+    }
+
+    if (read_repair == read_repair_decision::DC_LOCAL || is_datacenter_local(cl)) {
         auto it = boost::range::stable_partition(live_endpoints, is_local);
-        local_ep_count = std::distance(live_endpoints.begin(), it);
+        local_count = std::distance(live_endpoints.begin(), it);
+        if (is_datacenter_local(cl)) {
+            live_endpoints.erase(it, live_endpoints.end());
+        }
     }
 
-    switch (read_repair) {
-    case read_repair_decision::NONE:
-        bf = block_for(ks, cl);
-        break;
-    case read_repair_decision::DC_LOCAL:
-        bf = std::max(block_for(ks, cl), local_ep_count);
-        break;
-    case read_repair_decision::GLOBAL:
-        bf = live_endpoints.size();
-        break;
-    default:
-        throw std::runtime_error("Unknown read repair type");
+    size_t bf = block_for(ks, cl);
+
+    if (read_repair == read_repair_decision::DC_LOCAL) {
+        bf = std::max(block_for(ks, cl), local_count);
     }
 
-    if (extra && bf < live_endpoints.size()) {
+    if (bf >= live_endpoints.size()) { // RRD.DC_LOCAL + CL.LOCAL or CL.ALL
+        return std::move(live_endpoints);
+    }
+
+    if (cf) {
+        static thread_local std::default_random_engine random_engine;
+        static thread_local std::uniform_real_distribution<> lbalance = std::uniform_real_distribution<>(0, 1);
+
+        auto get_hit_rate = [cf] (gms::inet_address ep) -> float {
+            constexpr float max_hit_rate = 0.999;
+            auto ht = cf->get_hit_rate(ep);
+            if (float(ht.rate) < 0) {
+                return float(ht.rate);
+            } else if (lowres_clock::now() - ht.last_updated > std::chrono::milliseconds(1000)) {
+                // if a cache entry is not updates for a while try to send traffic there
+                // to get more up to date data, mark it updated to not send to much traffic there
+                cf->set_hit_rate(ep, ht.rate);
+                return max_hit_rate;
+            } else {
+                return std::min(float(ht.rate), max_hit_rate); // calculation below cannot work with hit rate 1
+            }
+        };
+
+        struct ep_info {
+            gms::inet_address ep;
+            float ht;
+            float p;
+        };
+
+        float ht_max = 0;
+        float ht_min = 1;
+        float mr_sum = 0;
+        float psum = 1;
+        bool old_node = false;
+        auto rf = live_endpoints.size();
+
+        auto epi = boost::copy_range<std::vector<ep_info>>(live_endpoints | boost::adaptors::transformed([&] (gms::inet_address ep) {
+            auto ht = get_hit_rate(ep);
+            old_node = old_node || ht < 0;
+            ht_max = std::max(ht_max, ht);
+            ht_min = std::min(ht_min, ht);
+            mr_sum += 1/(1.0 - ht);
+            // initially probability of each node is 1/rf, but may be recalculated later
+            return ep_info{ep, ht, psum/rf};
+        }));
+
+        live_endpoints.clear();
+
+        auto use_endpoint = [&] (ep_info& epi) {
+            live_endpoints.push_back(epi.ep);
+            psum -= epi.p;
+            epi.p = 0;
+        };
+
+        if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
+            float D = 0; // total deficit
+            float Dtag = 0;
+            psum = 0;
+            // recalculate p and psum according to hit rates
+            for (auto&& ep : epi) {
+                ep.p = 1 / (1.0 - ep.ht) / mr_sum;
+                psum += ep.p;
+                auto x = rf * ep.p - 1.0 / bf;
+                if (x >= 0) {
+                    D += x;
+                } else {
+                    Dtag += (1.0 - rf * ep.p);
+                }
+            }
+
+            auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0 / (rf * bf) <= e.p; };
+
+            // Calculate sum in Dtag formula
+            float Dtagsum = 0;
+            for (auto&& e : epi) {
+                if (is_mixed(e)) {
+                    // 1/(D - (NPi - 1/C))
+                    Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
+                }
+            }
+
+            // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
+            if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
+                auto p = epi[0].p;
+                if (is_mixed(epi[0])) {
+                    psum = epi[0].p = 1.0/bf;
+                    for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
+                        if (is_mixed(*i)) {
+                            // (1-1/C)(NPj-1/C)/(D-(NPi-1/C))
+                            i->p = (1.0f - 1.0f / bf) * (rf * i->p - 1.0f / bf) / (D - (rf * p - 1.0f / bf));
+                        } else {
+                            i->p = 0;
+                        }
+                        psum += i->p;
+                    }
+                } else {
+                    psum = epi[0].p = epi[0].p * rf;
+                    for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
+                        if (is_mixed(*i)) {
+                            auto x = (rf * i->p - 1.0f / bf);
+                            auto Dtagj = x * (1.0f - (1.0f - 1.0f / bf) * (Dtagsum - (1.0f / (D - x))));
+                            // (1 - NPi)Dtagj/Dtag
+                            i->p = (1.0f - rf * p) * Dtagj / Dtag;
+                        } else {
+                            i->p = 0;
+                        }
+                        psum += i->p;
+                    }
+                }
+            }
+
+        } else {
+            // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
+            if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
+                use_endpoint(epi[0]); // always use local node
+            }
+        }
+
+        while (live_endpoints.size() != bf + bool(extra)) {
+            auto r = lbalance(random_engine) * psum;
+            float s = 0;
+            for (auto&& e : epi | boost::adaptors::filtered(std::mem_fn(&ep_info::p))) {
+                s += e.p;
+                if (s >= r) {
+                    use_endpoint(e);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (extra) {
         *extra = live_endpoints[bf]; // extra replica for speculation
     }
 
-    live_endpoints.erase(live_endpoints.begin() + std::min(live_endpoints.size(), bf), live_endpoints.end());
+    live_endpoints.erase(live_endpoints.begin() + bf, live_endpoints.end());
 
     return std::move(live_endpoints);
 }
 
-std::vector<gms::inet_address> filter_for_query(consistency_level cl, keyspace& ks, std::vector<gms::inet_address>& live_endpoints) {
-    return filter_for_query(cl, ks, live_endpoints, read_repair_decision::NONE, nullptr);
+std::vector<gms::inet_address> filter_for_query(consistency_level cl, keyspace& ks, std::vector<gms::inet_address>& live_endpoints, column_family* cf) {
+    return filter_for_query(cl, ks, live_endpoints, read_repair_decision::NONE, nullptr, cf);
 }
 
 bool
