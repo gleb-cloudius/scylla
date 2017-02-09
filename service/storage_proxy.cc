@@ -2427,6 +2427,7 @@ protected:
                 try {
                     auto v = f.get();
                     _cf->set_hit_rate(ep, std::get<1>(v));
+                    logger.trace("{} mutation data hit rate {}", ep, float(std::get<1>(v)));
                     resolver->add_mutate_data(ep, std::get<0>(std::move(v)));
                     ++_proxy->_stats.mutation_data_read_completed.get_ep_stat(ep);
                 } catch(...) {
@@ -2442,6 +2443,7 @@ protected:
                 try {
                     auto v = f.get();
                     _cf->set_hit_rate(ep, std::get<1>(v));
+                    logger.trace("{} data hit rate {}", ep, float(std::get<1>(v)));
                     resolver->add_data(ep, std::get<0>(std::move(v)));
                     ++_proxy->_stats.data_read_completed.get_ep_stat(ep);
                 } catch(...) {
@@ -2457,6 +2459,7 @@ protected:
                 try {
                     auto v = f.get();
                     _cf->set_hit_rate(ep, std::get<2>(v));
+                    logger.trace("{} digest hit rate {}", ep, float(std::get<2>(v)));
                     resolver->add_digest(ep, std::get<0>(v), std::get<1>(v));
                     ++_proxy->_stats.digest_read_completed.get_ep_stat(ep);
                 } catch(...) {

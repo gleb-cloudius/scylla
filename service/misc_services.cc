@@ -105,6 +105,7 @@ void cache_hitrate_calculator::run_on(size_t master, lowres_clock::duration d) {
 }
 
 future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() {
+    print("recalculate_hitrates starts\n");
     struct stat {
         float h = 0;
         float m = 0;
@@ -145,10 +146,12 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
                     _diff = std::max(_diff, std::abs(float(cf.second->get_global_cache_hit_rate()) - rate));
                 }
                 cf.second->set_global_cache_hit_rate(cache_temperature(rate));
+                print("cpuid %d set cf=%s ht=%f (%f %f)\n", engine().cpu_id(), cf.second, float(cf.second->get_global_cache_hit_rate()), s.h, s.m);
             }
         });
     }).then([this] {
         // if max difference during this round is big schedule next recalculate earlier
+        print("diff=%f\n", _diff);
         if (_diff < 0.01) {
             return std::chrono::milliseconds(2000);
         } else {

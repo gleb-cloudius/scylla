@@ -191,6 +191,7 @@ filter_for_query(consistency_level cl,
             if (float(ht.rate) < 0) {
                 return float(ht.rate);
             } else if (lowres_clock::now() - ht.last_updated > std::chrono::milliseconds(1000)) {
+                cl_logger.trace("old entry for {}", ep);
                 // if a cache entry is not updates for a while try to send traffic there
                 // to get more up to date data, mark it updated to not send to much traffic there
                 cf->set_hit_rate(ep, ht.rate);
@@ -213,6 +214,8 @@ filter_for_query(consistency_level cl,
         bool old_node = false;
         auto rf = live_endpoints.size();
 
+        cl_logger.trace("live_endpoints.size = {}", rf);
+
         auto epi = boost::copy_range<std::vector<ep_info>>(live_endpoints | boost::adaptors::transformed([&] (gms::inet_address ep) {
             auto ht = get_hit_rate(ep);
             old_node = old_node || ht < 0;
@@ -232,6 +235,7 @@ filter_for_query(consistency_level cl,
         };
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
+            cl_logger.trace("mr_sum={}", mr_sum);
             float D = 0; // total deficit
             float Dtag = 0;
             psum = 0;
@@ -257,6 +261,12 @@ filter_for_query(consistency_level cl,
                     Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
                 }
             }
+
+            sstring log = sprint("ps before cpuid %d ", engine().cpu_id());
+            for (auto&& ep : epi) {
+                log += sprint(" %d: %f, %f, ", ep.ep, ep.p, ep.ht);
+            }
+            cl_logger.trace(log.c_str());
 
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
@@ -288,7 +298,13 @@ filter_for_query(consistency_level cl,
                 }
             }
 
+            log = sprint("ps after cpuid %d ", engine().cpu_id());
+            for (auto&& ep : epi) {
+                log += sprint(" %d: %f, ", ep.ep, ep.p);
+            }
+            cl_logger.trace(log.c_str());
         } else {
+            cl_logger.trace("old_node={}, min={} max={}", old_node, ht_min, ht_max);
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
                 use_endpoint(epi[0]); // always use local node
