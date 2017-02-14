@@ -126,8 +126,8 @@ sstring storage_service::get_config_supported_features() {
         LARGE_PARTITIONS_FEATURE,
         COUNTERS_FEATURE,
     };
+    features.push_back(MATERIALIZED_VIEWS_FEATURE);
     if (service::get_local_storage_service()._db.local().get_config().experimental()) {
-        features.push_back(MATERIALIZED_VIEWS_FEATURE);
         features.push_back(INDEXES_FEATURE);
     }
     return join(",", features);
@@ -1356,8 +1356,8 @@ future<> storage_service::init_server(int delay) {
             ss._large_partitions_feature = gms::feature(LARGE_PARTITIONS_FEATURE);
             ss._counters_feature = gms::feature(COUNTERS_FEATURE);
 
+            ss._materialized_views_feature = gms::feature(MATERIALIZED_VIEWS_FEATURE);
             if (ss._db.local().get_config().experimental()) {
-                ss._materialized_views_feature = gms::feature(MATERIALIZED_VIEWS_FEATURE);
                 ss._indexes_feature = gms::feature(INDEXES_FEATURE);
             }
         }).get();
