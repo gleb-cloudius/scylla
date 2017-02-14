@@ -236,29 +236,19 @@ filter_for_query(consistency_level cl,
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
             cl_logger.trace("mr_sum={}", mr_sum);
-            float D = 0; // total deficit
-            float Dtag = 0;
+            float diffsum = 0;
+            float restsum = 0;
             psum = 0;
             // recalculate p and psum according to hit rates
             for (auto&& ep : epi) {
                 ep.p = 1 / (1.0 - ep.ht) / mr_sum;
                 psum += ep.p;
-                auto x = rf * ep.p - 1.0 / bf;
-                if (x >= 0) {
-                    D += x;
+                // shoehorn probabilities to be not greater than 1/CL
+                if (ep.p > 1.0 / bf) {
+                    diffsum += (ep.p - 1.0 / bf);
+                    ep.p = 1.0 / bf;
                 } else {
-                    Dtag += (1.0 - rf * ep.p);
-                }
-            }
-
-            auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0 / (rf * bf) <= e.p; };
-
-            // Calculate sum in Dtag formula
-            float Dtagsum = 0;
-            for (auto&& e : epi) {
-                if (is_mixed(e)) {
-                    // 1/(D - (NPi - 1/C))
-                    Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
+                    restsum += ep.p;
                 }
             }
 
@@ -270,6 +260,31 @@ filter_for_query(consistency_level cl,
 
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
+                auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0 / (rf * bf) <= e.p; };
+                float D = 0; // total deficit
+                float Dtag = 0;
+                for (auto&& ep : epi) {
+                    // redistribute eveything above 1/CL
+                    if (ep.p < 1.0 / bf) {
+                        ep.p += (ep.p * diffsum / restsum);
+                    }
+                    auto x = rf * ep.p - 1.0 / bf;
+                    if (x >= 0) {
+                        D += x;
+                    } else {
+                        Dtag += (1.0 - rf * ep.p);
+                    }
+                }
+
+                // Calculate sum in Dtag formula
+                float Dtagsum = 0;
+                for (auto&& e : epi) {
+                    if (is_mixed(e)) {
+                        // 1/(D - (NPi - 1/C))
+                        Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
+                    }
+                }
+
                 auto p = epi[0].p;
                 if (is_mixed(epi[0])) {
                     psum = epi[0].p = 1.0/bf;
