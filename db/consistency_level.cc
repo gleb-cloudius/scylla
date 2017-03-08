@@ -254,7 +254,7 @@ filter_for_query(consistency_level cl,
                 float D = 0; // total deficit
                 float Dtag = 0;
                 for (auto&& ep : epi) {
-                    // redistribute eveything above 1/CL
+                    // redistribute everything above 1/CL
                     if (ep.p < 1.0 / bf) {
                         ep.p += (ep.p * diffsum / restsum);
                     }

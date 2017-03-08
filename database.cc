@@ -3983,8 +3983,11 @@ void column_family::set_hit_rate(gms::inet_address addr, cache_temperature rate)
 
 column_family::cache_hit_rate column_family::get_hit_rate(gms::inet_address addr) {
     auto it = _cluster_cache_hit_rates.find(addr);
+    if (utils::fb_utilities::get_broadcast_address() == addr) {
+        return cache_hit_rate { _global_cache_hit_rate, lowres_clock::now()};
+    }
     if (it == _cluster_cache_hit_rates.end()) {
-        return cache_hit_rate {cache_temperature(0.0f), lowres_clock::now()};
+        return cache_hit_rate {cache_temperature(1.0f), lowres_clock::now()};
     } else {
         return it->second;
     }
