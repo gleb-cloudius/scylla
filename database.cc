@@ -2087,6 +2087,8 @@ database::setup_metrics() {
 
         sm::make_queue_length("counter_cell_lock_pending", _cl_stats->operations_waiting_for_lock,
                              sm::description("The number of counter updates waiting for a lock.")),
+        sm::make_gauge("global_cache_hit_rate", [this] { return float(_global_cache_hit_rate); },
+                       sm::description("Holds the current amount of memory used for results.")),
     });
 }
 

@@ -145,6 +145,8 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
                     _diff = std::max(_diff, std::abs(float(cf.second->get_global_cache_hit_rate()) - rate));
                 }
                 cf.second->set_global_cache_hit_rate(cache_temperature(rate));
+                if (cf.second->schema()->cf_name() == "standard1")
+                    db._global_cache_hit_rate = cache_temperature(rate);
             }
         });
     }).then([this] {

@@ -1136,6 +1136,7 @@ public:
 class database {
 public:
     using timeout_clock = lowres_clock;
+    cache_temperature _global_cache_hit_rate = cache_temperature(0.0f);
 private:
     ::cf_stats _cf_stats;
     static constexpr size_t max_concurrent_reads() { return 100; }
