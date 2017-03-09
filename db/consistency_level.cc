@@ -235,10 +235,13 @@ filter_for_query(consistency_level cl,
             float diffsum = 0;
             float restsum = 0;
             psum = 0;
+            sstring log;
+
             // recalculate p and psum according to hit rates
             for (auto&& ep : epi) {
                 ep.p = 1 / (1.0 - ep.ht) / mr_sum;
                 psum += ep.p;
+                log += sprint("%d: %.10f ", ep.ep, ep.p);
                 // shoehorn probabilities to be not greater than 1/CL
                 if (ep.p > 1.0 / bf) {
                     diffsum += (ep.p - 1.0 / bf);
@@ -247,6 +250,8 @@ filter_for_query(consistency_level cl,
                     restsum += ep.p;
                 }
             }
+
+            cl_logger.debug("p according to hit rate (diffsum={}, restsum={}, psum={}): {}", diffsum, restsum, psum, log); log = "";
 
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
@@ -264,7 +269,9 @@ filter_for_query(consistency_level cl,
                     } else {
                         Dtag += (1.0 - rf * ep.p);
                     }
+                    log += sprint("%d: %.10f ", ep.ep, ep.p);
                 }
+                cl_logger.debug("p after shoehorn (D={}, Dtag={}): {}", log, D, Dtag); log = "";
 
                 // Calculate sum in Dtag formula
                 float Dtagsum = 0;
@@ -274,10 +281,12 @@ filter_for_query(consistency_level cl,
                         Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
                     }
                 }
+                cl_logger.debug("Dtagsum={}", Dtagsum);
 
                 auto p = epi[0].p;
                 if (is_mixed(epi[0])) {
                     psum = epi[0].p = 1.0/bf;
+                    log += sprint("mixed %d: %.10f", epi[0].ep, epi[0].p);
                     for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
                         if (is_mixed(*i)) {
                             // (1-1/C)(NPj-1/C)/(D-(NPi-1/C))
@@ -286,9 +295,11 @@ filter_for_query(consistency_level cl,
                             i->p = 0;
                         }
                         psum += i->p;
+                        log += sprint(" %d: %.10f", i->ep, i->p);
                     }
                 } else {
                     psum = epi[0].p = epi[0].p * rf;
+                    log += sprint("not mixed %d: %.10f", epi[0].ep, epi[0].p);
                     for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
                         if (is_mixed(*i)) {
                             auto x = (rf * i->p - 1.0f / bf);
@@ -299,8 +310,10 @@ filter_for_query(consistency_level cl,
                             i->p = 0;
                         }
                         psum += i->p;
+                        log += sprint( " %d: %.10f", i->ep, i->p);
                     }
                 }
+                cl_logger.debug("final p (psum={}): {}", psum, log); log = "";
             }
 
         } else {
