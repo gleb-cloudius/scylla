@@ -232,8 +232,11 @@ filter_for_query(consistency_level cl,
         };
 
         sstring log_message;
+        thread_local static unsigned prev_branches = 0;
+        unsigned branches = 0;
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
+            branches |= (1 << 0);
             float diffsum = 0;
             float restsum = 0;
             psum = 0;
@@ -258,6 +261,7 @@ filter_for_query(consistency_level cl,
 
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
+                branches |= (1 << 1);
                 auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0 / (rf * bf) <= e.p; };
                 float D = 0; // total deficit
                 float Dtag = 0;
@@ -290,6 +294,7 @@ filter_for_query(consistency_level cl,
 
                 auto p = epi[0].p;
                 if (is_mixed(epi[0])) {
+                    branches |= (1 << 2);
                     psum = epi[0].p = 1.0/bf;
                     log += sprint("mixed %d: %.10f", epi[0].ep, epi[0].p);
                     for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
@@ -327,6 +332,10 @@ filter_for_query(consistency_level cl,
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
                 use_endpoint(epi[0]); // always use local node
             }
+        }
+        if (prev_branches != branches) {
+            cl_logger.error("new branch {}!={}\n{}", prev_branches, branches, log_message);
+            prev_branches= branches;
         }
 
         int xxx = 0;
