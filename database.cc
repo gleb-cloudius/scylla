@@ -3994,5 +3994,5 @@ column_family::cache_hit_rate column_family::get_hit_rate(gms::inet_address addr
 }
 
 void column_family::drop_hit_rate(gms::inet_address addr) {
-    _cluster_cache_hit_rates.erase(addr);
+    _cluster_cache_hit_rates[addr] = {cache_temperature(0.0f), lowres_clock::now()};
 }
