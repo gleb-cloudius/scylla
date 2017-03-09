@@ -231,6 +231,8 @@ filter_for_query(consistency_level cl,
             epi.p = 0;
         };
 
+        sstring log_message;
+
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
             float diffsum = 0;
             float restsum = 0;
@@ -251,7 +253,8 @@ filter_for_query(consistency_level cl,
                 }
             }
 
-            cl_logger.debug("p according to hit rate (diffsum={}, restsum={}, psum={}): {}", diffsum, restsum, psum, log); log = "";
+ //           cl_logger.debug("p according to hit rate (diffsum={}, restsum={}, psum={}): {}", diffsum, restsum, psum, log); log = "";
+            log_message += sprint("p according to hit rate (diffsum=%.10f, restsum=%.10f, psum=%.10f): %s\n", diffsum, restsum, psum, log); log = "";
 
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
@@ -271,7 +274,8 @@ filter_for_query(consistency_level cl,
                     }
                     log += sprint("%d: %.10f ", ep.ep, ep.p);
                 }
-                cl_logger.debug("p after shoehorn (D={}, Dtag={}): {}", log, D, Dtag); log = "";
+                //cl_logger.debug("p after shoehorn (D={}, Dtag={}): {}", log, D, Dtag); log = "";
+                log_message += sprint("p after shoehorn (D=%.10f, Dtag=%.10f): %s\n", D, Dtag, log); log = "";
 
                 // Calculate sum in Dtag formula
                 float Dtagsum = 0;
@@ -281,7 +285,8 @@ filter_for_query(consistency_level cl,
                         Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
                     }
                 }
-                cl_logger.debug("Dtagsum={}", Dtagsum);
+                //cl_logger.debug("Dtagsum={}", Dtagsum);
+                log_message += sprint("%.10f\n", Dtagsum);
 
                 auto p = epi[0].p;
                 if (is_mixed(epi[0])) {
@@ -313,7 +318,8 @@ filter_for_query(consistency_level cl,
                         log += sprint( " %d: %.10f", i->ep, i->p);
                     }
                 }
-                cl_logger.debug("final p (psum={}): {}", psum, log); log = "";
+//                cl_logger.debug("final p (psum={}): {}", psum, log); log = "";
+                log_message += sprint("final p (psum=%.10f): %s\n", psum, log); log = "";
             }
 
         } else {
@@ -323,7 +329,11 @@ filter_for_query(consistency_level cl,
             }
         }
 
+        int xxx = 0;
         while (live_endpoints.size() != bf + bool(extra)) {
+            if (xxx++ == 100) {
+                cl_logger.error(log_message.c_str());
+            }
             auto r = lbalance(random_engine) * psum;
             float s = 0;
             for (auto&& e : epi | boost::adaptors::filtered(std::mem_fn(&ep_info::p))) {
