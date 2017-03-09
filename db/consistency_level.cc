@@ -336,6 +336,8 @@ filter_for_query(consistency_level cl,
         if (prev_branches != branches) {
             cl_logger.error("new branch {}!={}\n{}", prev_branches, branches, log_message);
             prev_branches= branches;
+        } else {
+            cl_logger.debug(log_message.c_str());
         }
 
         int xxx = 0;
