@@ -297,7 +297,7 @@ filter_for_query(consistency_level cl,
                             // (1-1/C)(NPj-1/C)/(D-(NPi-1/C))
                             i->p = (1.0f - 1.0f / bf) * (rf * i->p - 1.0f / bf) / (D - (rf * p - 1.0f / bf));
                         } else {
-                            i->p = 0;
+                            i->p = 0.00001;
                         }
                         psum += i->p;
                         log += sprint(" %d: %.10f", i->ep, i->p);
@@ -312,7 +312,7 @@ filter_for_query(consistency_level cl,
                             // (1 - NPi)Dtagj/Dtag
                             i->p = (1.0f - rf * p) * Dtagj / Dtag;
                         } else {
-                            i->p = 0;
+                            i->p = 0.00001;
                         }
                         psum += i->p;
                         log += sprint( " %d: %.10f", i->ep, i->p);
