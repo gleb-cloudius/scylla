@@ -213,8 +213,11 @@ filter_for_query(consistency_level cl,
         bool old_node = false;
         auto rf = live_endpoints.size();
 
+        sstring log_message = "\n";
+        sstring log;
         auto epi = boost::copy_range<std::vector<ep_info>>(live_endpoints | boost::adaptors::transformed([&] (gms::inet_address ep) {
             auto ht = get_hit_rate(ep);
+            log += sprint("%d: %.10f ", ep, ht);
             old_node = old_node || ht < 0;
             ht_max = std::max(ht_max, ht);
             ht_min = std::min(ht_min, ht);
@@ -222,6 +225,7 @@ filter_for_query(consistency_level cl,
             // initially probability of each node is 1/rf, but may be recalculated later
             return ep_info{ep, ht, psum/rf};
         }));
+        log_message += sprint("hit rates: (mr_sum=%.10f) %s\n",mr_sum, log); log = "";
 
         live_endpoints.clear();
 
@@ -231,7 +235,6 @@ filter_for_query(consistency_level cl,
             epi.p = 0;
         };
 
-        sstring log_message;
         thread_local static unsigned prev_branches = 0;
         unsigned branches = 0;
 
@@ -240,7 +243,6 @@ filter_for_query(consistency_level cl,
             float diffsum = 0;
             float restsum = 0;
             psum = 0;
-            sstring log;
 
             // recalculate p and psum according to hit rates
             for (auto&& ep : epi) {
