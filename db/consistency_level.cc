@@ -221,7 +221,7 @@ filter_for_query(consistency_level cl,
             old_node = old_node || ht < 0;
             ht_max = std::max(ht_max, ht);
             ht_min = std::min(ht_min, ht);
-            mr_sum += 1/(1.0 - ht);
+            mr_sum += 1/(1.0f - ht);
             // initially probability of each node is 1/rf, but may be recalculated later
             return ep_info{ep, ht, psum/rf};
         }));
@@ -246,13 +246,13 @@ filter_for_query(consistency_level cl,
 
             // recalculate p and psum according to hit rates
             for (auto&& ep : epi) {
-                ep.p = 1 / (1.0 - ep.ht) / mr_sum;
+                ep.p = 1 / (1.0f - ep.ht) / mr_sum;
                 psum += ep.p;
                 log += sprint("%d: %.10f ", ep.ep, ep.p);
                 // shoehorn probabilities to be not greater than 1/CL
-                if (ep.p > 1.0 / bf) {
-                    diffsum += (ep.p - 1.0 / bf);
-                    ep.p = 1.0 / bf;
+                if (ep.p > 1.0f / bf) {
+                    diffsum += (ep.p - 1.0f / bf);
+                    ep.p = 1.0f / bf;
                 } else {
                     restsum += ep.p;
                 }
@@ -264,19 +264,19 @@ filter_for_query(consistency_level cl,
             // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
             if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
                 branches |= (1 << 1);
-                auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0 / (rf * bf) <= e.p; };
+                auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0f / (rf * bf) <= e.p; };
                 float D = 0; // total deficit
                 float Dtag = 0;
                 for (auto&& ep : epi) {
                     // redistribute everything above 1/CL
-                    if (ep.p < 1.0 / bf) {
+                    if (ep.p < 1.0f / bf) {
                         ep.p += (ep.p * diffsum / restsum);
                     }
-                    auto x = rf * ep.p - 1.0 / bf;
+                    auto x = rf * ep.p - 1.0f / bf;
                     if (x >= 0) {
                         D += x;
                     } else {
-                        Dtag += (1.0 - rf * ep.p);
+                        Dtag += (1.0f - rf * ep.p);
                     }
                     log += sprint("%d: %.10f ", ep.ep, ep.p);
                 }
@@ -288,7 +288,7 @@ filter_for_query(consistency_level cl,
                 for (auto&& e : epi) {
                     if (is_mixed(e)) {
                         // 1/(D - (NPi - 1/C))
-                        Dtagsum += 1.0/(D - (rf * e.p - 1.0 / bf));
+                        Dtagsum += 1.0f / (D - (rf * e.p - 1.0f / bf));
                     }
                 }
                 //cl_logger.debug("Dtagsum={}", Dtagsum);
@@ -297,7 +297,7 @@ filter_for_query(consistency_level cl,
                 auto p = epi[0].p;
                 if (is_mixed(epi[0])) {
                     branches |= (1 << 2);
-                    psum = epi[0].p = 1.0/bf;
+                    psum = epi[0].p = 1.0f / bf;
                     log += sprint("mixed %d: %.10f", epi[0].ep, epi[0].p);
                     for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
                         if (is_mixed(*i)) {
