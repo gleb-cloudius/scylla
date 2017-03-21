@@ -339,7 +339,13 @@ filter_for_query(consistency_level cl,
             cl_logger.error("new branch {}!={}\n{}", prev_branches, branches, log_message);
             prev_branches= branches;
         } else {
-            cl_logger.debug(log_message.c_str());
+            if (cl_logger.is_enabled(logging::log_level::debug)) {
+                thread_local static lowres_clock::time_point last(std::chrono::milliseconds(0));
+                if (lowres_clock::now() - last > std::chrono::milliseconds(1000)) {
+                    last = lowres_clock::now();
+                    cl_logger.debug(log_message.c_str());
+                }
+            }
         }
 
         int xxx = 0;
