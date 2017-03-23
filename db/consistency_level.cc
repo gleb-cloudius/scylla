@@ -315,7 +315,7 @@ filter_for_query(consistency_level cl,
                     for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
                         if (is_mixed(*i)) {
                             auto x = (rf * i->p - 1.0f / bf);
-                            auto Dtagj = x * (1.0f - (1.0f - 1.0f / bf) * (Dtagsum - (1.0f / (D - x))));
+                            auto Dtagj = isinf(Dtagsum) ? x : x * (1.0f - (1.0f - 1.0f / bf) * (Dtagsum - (1.0f / (D - x))));
                             // (1 - NPi)Dtagj/Dtag
                             i->p = (1.0f - rf * p) * Dtagj / Dtag;
                         } else {
