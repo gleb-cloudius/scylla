@@ -511,7 +511,7 @@ public:
     sstring get_gossip_status(const endpoint_state& ep_state) const;
     sstring get_gossip_status(const inet_address& endpoint) const;
 public:
-    future<> wait_for_gossip_to_settle();
+    void wait_for_gossip_to_settle();
 private:
     uint64_t _nr_run = 0;
     bool _ms_registered = false;
