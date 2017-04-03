@@ -53,6 +53,7 @@
 #include "locator/abstract_replication_strategy.hh"
 #include "locator/network_topology_strategy.hh"
 #include "utils/fb_utilities.hh"
+#include "prob.hh"
 
 namespace db {
 
@@ -182,9 +183,6 @@ filter_for_query(consistency_level cl,
     }
 
     if (cf) {
-        static thread_local std::default_random_engine random_engine;
-        static thread_local std::uniform_real_distribution<> lbalance = std::uniform_real_distribution<>(0, 1);
-
         auto get_hit_rate = [cf] (gms::inet_address ep) -> float {
             constexpr float max_hit_rate = 0.999;
             auto ht = cf->get_hit_rate(ep);
@@ -200,168 +198,30 @@ filter_for_query(consistency_level cl,
             }
         };
 
-        struct ep_info {
-            gms::inet_address ep;
-            float ht;
-            float p;
-        };
-
         float ht_max = 0;
         float ht_min = 1;
-        float mr_sum = 0;
-        float psum = 1;
         bool old_node = false;
-        auto rf = live_endpoints.size();
 
-        sstring log_message = "\n";
-        sstring log;
-        auto epi = boost::copy_range<std::vector<ep_info>>(live_endpoints | boost::adaptors::transformed([&] (gms::inet_address ep) {
+        auto epi = boost::copy_range<std::vector<std::pair<gms::inet_address, float>>>(live_endpoints | boost::adaptors::transformed([&] (gms::inet_address ep) {
             auto ht = get_hit_rate(ep);
-            log += sprint("%d: %.10f ", ep, ht);
             old_node = old_node || ht < 0;
             ht_max = std::max(ht_max, ht);
             ht_min = std::min(ht_min, ht);
-            mr_sum += 1/(1.0f - ht);
-            // initially probability of each node is 1/rf, but may be recalculated later
-            return ep_info{ep, ht, psum/rf};
+            return std::make_pair(ep, ht);
         }));
-        log_message += sprint("hit rates: (mr_sum=%.10f) %s\n",mr_sum, log); log = "";
-
-        live_endpoints.clear();
-
-        auto use_endpoint = [&] (ep_info& epi) {
-            live_endpoints.push_back(epi.ep);
-            psum -= epi.p;
-            epi.p = 0;
-        };
-
-        thread_local static unsigned prev_branches = 0;
-        unsigned branches = 0;
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
-            branches |= (1 << 0);
-            float diffsum = 0;
-            float restsum = 0;
-            psum = 0;
-
-            // recalculate p and psum according to hit rates
-            for (auto&& ep : epi) {
-                ep.p = 1 / (1.0f - ep.ht) / mr_sum;
-                psum += ep.p;
-                log += sprint("%d: %.10f ", ep.ep, ep.p);
-                // shoehorn probabilities to be not greater than 1/CL
-                if (ep.p > 1.0f / bf) {
-                    diffsum += (ep.p - 1.0f / bf);
-                    ep.p = 1.0f / bf;
-                } else {
-                    restsum += ep.p;
-                }
-            }
-
- //           cl_logger.debug("p according to hit rate (diffsum={}, restsum={}, psum={}): {}", diffsum, restsum, psum, log); log = "";
-            log_message += sprint("p according to hit rate (diffsum=%.10f, restsum=%.10f, psum=%.10f): %s\n", diffsum, restsum, psum, log); log = "";
-
-            // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
-            if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
-                branches |= (1 << 1);
-                auto is_mixed = [bf, rf] (const ep_info& e) { return 1.0f / (rf * bf) <= e.p; };
-                float D = 0; // total deficit
-                float Dtag = 0;
-                for (auto&& ep : epi) {
-                    // redistribute everything above 1/CL
-                    if (ep.p < 1.0f / bf) {
-                        ep.p += (ep.p * diffsum / restsum);
-                    }
-                    auto x = rf * ep.p - 1.0f / bf;
-                    if (x >= 0) {
-                        D += x;
-                    } else {
-                        Dtag += (1.0f - rf * ep.p);
-                    }
-                    log += sprint("%d: %.10f ", ep.ep, ep.p);
-                }
-                //cl_logger.debug("p after shoehorn (D={}, Dtag={}): {}", log, D, Dtag); log = "";
-                log_message += sprint("p after shoehorn (D=%.10f, Dtag=%.10f): %s\n", D, Dtag, log); log = "";
-
-                // Calculate sum in Dtag formula
-                float Dtagsum = 0;
-                for (auto&& e : epi) {
-                    if (is_mixed(e)) {
-                        // 1/(D - (NPi - 1/C))
-                        Dtagsum += 1.0f / (D - (rf * e.p - 1.0f / bf));
-                    }
-                }
-                //cl_logger.debug("Dtagsum={}", Dtagsum);
-                log_message += sprint("%.10f\n", Dtagsum);
-
-                auto p = epi[0].p;
-                if (is_mixed(epi[0])) {
-                    branches |= (1 << 2);
-                    psum = epi[0].p = 1.0f / bf;
-                    log += sprint("mixed %d: %.10f", epi[0].ep, epi[0].p);
-                    for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
-                        if (is_mixed(*i)) {
-                            // (1-1/C)(NPj-1/C)/(D-(NPi-1/C))
-                            i->p = (1.0f - 1.0f / bf) * (rf * i->p - 1.0f / bf) / (D - (rf * p - 1.0f / bf));
-                        } else {
-                            i->p = 0.00001;
-                        }
-                        psum += i->p;
-                        log += sprint(" %d: %.10f", i->ep, i->p);
-                    }
-                } else {
-                    psum = epi[0].p = epi[0].p * rf;
-                    log += sprint("not mixed %d: %.10f", epi[0].ep, epi[0].p);
-                    for (auto i = std::next(epi.begin()); i != epi.end(); i++) {
-                        if (is_mixed(*i)) {
-                            auto x = (rf * i->p - 1.0f / bf);
-                            auto Dtagj = isinf(Dtagsum) ? x : x * (1.0f - (1.0f - 1.0f / bf) * (Dtagsum - (1.0f / (D - x))));
-                            // (1 - NPi)Dtagj/Dtag
-                            i->p = (1.0f - rf * p) * Dtagj / Dtag;
-                        } else {
-                            i->p = 0.00001;
-                        }
-                        psum += i->p;
-                        log += sprint( " %d: %.10f", i->ep, i->p);
-                    }
-                }
-//                cl_logger.debug("final p (psum={}): {}", psum, log); log = "";
-                log_message += sprint("final p (psum=%.10f): %s\n", psum, log); log = "";
-            }
-
-        } else {
-            // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
-            if (epi[0].ep == utils::fb_utilities::get_broadcast_address()) {
-                use_endpoint(epi[0]); // always use local node
-            }
-        }
-        if (prev_branches != branches) {
-            cl_logger.error("new branch {}!={}\n{}", prev_branches, branches, log_message);
-            prev_branches= branches;
-        } else {
-            if (cl_logger.is_enabled(logging::log_level::debug)) {
-                thread_local static lowres_clock::time_point last(std::chrono::milliseconds(0));
-                if (lowres_clock::now() - last > std::chrono::milliseconds(1000)) {
-                    last = lowres_clock::now();
-                    cl_logger.debug(log_message.c_str());
-                }
-            }
-        }
-
-        int xxx = 0;
-        while (live_endpoints.size() != bf + bool(extra)) {
-            if (xxx++ == 100) {
-                cl_logger.error(log_message.c_str());
-            }
-            auto r = lbalance(random_engine) * psum;
-            float s = 0;
-            for (auto&& e : epi | boost::adaptors::filtered(std::mem_fn(&ep_info::p))) {
-                s += e.p;
-                if (s >= r) {
-                    use_endpoint(e);
+            auto cg = miss_equalizing_combination(epi, 0, bf);
+            auto v = cg.get();
+            assert(v.size() == bf);
+            // add extra node
+            for (auto&& i : live_endpoints) {
+                if (boost::range::find(v, i) == v.end()) {
+                    v.push_back(i);
                     break;
                 }
             }
+            live_endpoints = v;
         }
     }
 
