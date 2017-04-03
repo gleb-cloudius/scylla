@@ -211,7 +211,13 @@ filter_for_query(consistency_level cl,
         }));
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
-            auto cg = miss_equalizing_combination(epi, 0, bf);
+            boost::range::sort(epi, [] (const auto& a, const auto& b) { return a.first < b.first; });
+            unsigned i = 0;
+            for (i = 0; i < epi.size(); i++) {
+                if (epi[i].first == utils::fb_utilities::get_broadcast_address())
+                    break;
+            }
+            auto cg = miss_equalizing_combination(epi, i, bf);
             auto v = cg.get();
             assert(v.size() == bf);
             // add extra node
