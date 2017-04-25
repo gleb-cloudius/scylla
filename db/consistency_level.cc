@@ -211,17 +211,10 @@ filter_for_query(consistency_level cl,
         }));
 
         if (!old_node && ht_max - ht_min > 0.01) { // if there is old node or hit rates are close skip calculations
-            auto cg = miss_equalizing_combination(epi, 0, bf);
-            auto v = cg.get();
-            assert(v.size() == bf);
-            // add extra node
-            for (auto&& i : live_endpoints) {
-                if (boost::range::find(v, i) == v.end()) {
-                    v.push_back(i);
-                    break;
-                }
-            }
-            live_endpoints = v;
+            // local node is always first if present (see storage_proxy::get_live_sorted_endpoints)
+            unsigned local_idx = epi[0].first == utils::fb_utilities::get_broadcast_address() ? 0 : epi.size() + 1;
+            auto cg = miss_equalizing_combination(epi, local_idx, bf, bool(extra));
+            live_endpoints = cg.get();
         }
     }
 
