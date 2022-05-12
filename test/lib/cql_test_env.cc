@@ -61,6 +61,7 @@
 #include "streaming/stream_manager.hh"
 #include "debug.hh"
 #include "db/schema_tables.hh"
+#include "service/raft/raft_group0_client.hh"
 
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -130,6 +131,8 @@ private:
     sharded<qos::service_level_controller>& _sl_controller;
     sharded<service::migration_manager>& _mm;
     sharded<db::batchlog_manager>& _batchlog_manager;
+    service::raft_group0_client& _group0_client;
+
 private:
     struct core_local_state {
         service::client_state client_state;
@@ -178,7 +181,8 @@ public:
             sharded<service::migration_notifier>& mnotifier,
             sharded<service::migration_manager>& mm,
             sharded<qos::service_level_controller> &sl_controller,
-            sharded<db::batchlog_manager>& batchlog_manager)
+            sharded<db::batchlog_manager>& batchlog_manager,
+            service::raft_group0_client& client)
             : _db(db)
             , _qp(qp)
             , _auth_service(auth_service)
@@ -188,6 +192,7 @@ public:
             , _sl_controller(sl_controller)
             , _mm(mm)
             , _batchlog_manager(batchlog_manager)
+            , _group0_client(client)
     {
         adjust_rlimit();
     }
@@ -397,6 +402,10 @@ public:
 
     virtual sharded<db::batchlog_manager>& batchlog_manager() override {
         return _batchlog_manager;
+    }
+
+    virtual service::raft_group0_client& get_raft_group0_client() override {
+        return _group0_client;
     }
 
     virtual future<> refresh_client_state() override {
@@ -646,7 +655,10 @@ public:
             forward_service.start(std::ref(ms), std::ref(proxy), std::ref(db), std::ref(token_metadata)).get();
             auto stop_forward_service =  defer([&forward_service] { forward_service.stop().get(); });
 
-            mm.start(std::ref(mm_notif), std::ref(feature_service), std::ref(ms), std::ref(proxy), std::ref(gossiper), std::ref(raft_gr), std::ref(sys_ks)).get();
+            // gropu0 client exists only on shard 0
+            service::raft_group0_client group0_client(raft_gr.local());
+
+            mm.start(std::ref(mm_notif), std::ref(feature_service), std::ref(ms), std::ref(proxy), std::ref(gossiper), std::ref(group0_client), std::ref(sys_ks)).get();
             auto stop_mm = defer([&mm] { mm.stop().get(); });
 
             cql3::query_processor::memory_config qp_mcfg = {memory::stats().total_memory() / 256, memory::stats().total_memory() / 2560};
@@ -745,7 +757,7 @@ public:
                 cdc.stop().get();
             });
 
-            ss.local().init_server(qp.local()).get();
+            ss.local().init_server(qp.local(), group0_client).get();
             try {
                 ss.local().join_cluster().get();
             } catch (std::exception& e) {
@@ -803,7 +815,7 @@ public:
                 // The default user may already exist if this `cql_test_env` is starting with previously populated data.
             }
 
-            single_node_cql_env env(db, qp, auth_service, view_builder, view_update_generator, mm_notif, mm, std::ref(sl_controller), bm);
+            single_node_cql_env env(db, qp, auth_service, view_builder, view_update_generator, mm_notif, mm, std::ref(sl_controller), bm, group0_client);
             env.start().get();
             auto stop_env = defer([&env] { env.stop().get(); });
 

@@ -49,6 +49,7 @@ namespace service {
 
 class client_state;
 class migration_manager;
+class raft_group0_client;
 
 }
 
@@ -158,6 +159,8 @@ public:
     virtual sharded<db::batchlog_manager>& batchlog_manager() = 0;
 
     virtual future<> refresh_client_state() = 0;
+
+    virtual service::raft_group0_client& get_raft_group0_client() = 0;
 
     data_dictionary::database data_dictionary();
 };
