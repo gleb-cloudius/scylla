@@ -1028,6 +1028,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/broadcast_tables/experimental/lang.cc',
                 'tasks/task_manager.cc',
                 'rust/wasmtime_bindings/src/lib.rs',
+                'service/topology_state_machine.cc',
                 ] + [Antlr3Grammar('cql3/Cql.g')] + [Thrift('interface/cassandra.thrift', 'Cassandra')] \
                   + scylla_raft_core
                )
