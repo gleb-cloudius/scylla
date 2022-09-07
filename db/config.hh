@@ -81,9 +81,8 @@ namespace db {
 
 /// Enumeration of all valid values for the `experimental` config entry.
 struct experimental_features_t {
-    // NOTE: RAFT feature is not enabled via `experimental` umbrella flag.
     // This option should be enabled explicitly.
-    enum class feature { UNUSED, UDF, ALTERNATOR_STREAMS, ALTERNATOR_TTL, RAFT,
+    enum class feature { UNUSED, UDF, ALTERNATOR_STREAMS, ALTERNATOR_TTL,
             KEYSPACE_STORAGE_OPTIONS };
     static std::map<sstring, feature> map(); // See enum_option.
     static std::vector<enum_option<experimental_features_t>> all();
@@ -379,6 +378,8 @@ public:
 
     named_value<bool> ignore_truncation_record;
     named_value<bool> force_schema_commit_log;
+
+    named_value<bool> consistent_cluster_management;
 
     seastar::logging_settings logging_settings(const log_cli::options&) const;
 
