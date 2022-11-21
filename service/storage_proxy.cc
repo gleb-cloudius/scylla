@@ -3735,16 +3735,23 @@ void storage_proxy::send_to_live_endpoints(storage_proxy::response_id_type respo
     auto& stats = handler_ptr->stats();
     auto& handler = *handler_ptr;
     auto& global_stats = handler._proxy->_global_stats;
-    auto& topology = handler_ptr->_effective_replication_map_ptr->get_topology();
-    auto local_dc = topology.get_datacenter();
+    if (handler_ptr->_effective_replication_map_ptr->get_replication_strategy().get_type() != locator::replication_strategy_type::local) {
+        auto& topology = handler_ptr->_effective_replication_map_ptr->get_topology();
+        auto local_dc = topology.get_datacenter();
 
-    for(auto dest: handler.get_targets()) {
-        sstring dc = topology.get_datacenter(dest);
-        // read repair writes do not go through coordinator since mutations are per destination
-        if (handler.read_repair_write() || dc == local_dc) {
+        for(auto dest: handler.get_targets()) {
+            sstring dc = topology.get_datacenter(dest);
+            // read repair writes do not go through coordinator since mutations are per destination
+            if (handler.read_repair_write() || dc == local_dc) {
+                local.emplace_back("", inet_address_vector_replica_set({dest}));
+            } else {
+                dc_groups[dc].push_back(dest);
+            }
+        }
+    } else {
+        // Local replication strategy writes are always local
+        for(auto dest: handler.get_targets()) {
             local.emplace_back("", inet_address_vector_replica_set({dest}));
-        } else {
-            dc_groups[dc].push_back(dest);
         }
     }
 
