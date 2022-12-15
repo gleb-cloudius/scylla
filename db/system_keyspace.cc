@@ -17,6 +17,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/json/json_elements.hh>
+#include "mutation_partition_visitor.hh"
 #include "system_keyspace.hh"
 #include "types.hh"
 #include "service/storage_proxy.hh"
@@ -184,6 +185,28 @@ schema_ptr system_keyspace::batchlog() {
        return builder.build(schema_builder::compact_storage::no);
     }();
     return paxos;
+}
+
+schema_ptr system_keyspace::topology() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, TOPOLOGY);
+        return schema_builder(NAME, TOPOLOGY, std::optional(id))
+            .with_column("host_id", uuid_type, column_kind::partition_key)
+            .with_column("datacenter", utf8_type)
+            .with_column("rack", utf8_type)
+            .with_column("tokens", set_type_impl::get_instance(utf8_type, true))
+            .with_column("replication_state", utf8_type)
+            .with_column("node_state", utf8_type)
+            .with_column("release_version", utf8_type)
+            .with_column("topology_request", utf8_type)
+            .with_column("replaced_id", uuid_type)
+            .set_comment("Current state of topology change machine")
+            .with_version(generate_schema_version(id))
+            .set_wait_for_sync_to_commitlog(true)
+            .with_null_sharder()
+            .build();
+    }();
+    return schema;
 }
 
 schema_ptr system_keyspace::raft() {
@@ -2689,6 +2712,10 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
     if (cfg.consistent_cluster_management()) {
         r.insert(r.end(), {raft(), raft_snapshots(), raft_snapshot_config(), group0_history(), discovery()});
 
+        if (cfg.check_experimental(db::experimental_features_t::feature::RAFT)) {
+            r.insert(r.end(), {topology()});
+        }
+
         if (cfg.check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
             r.insert(r.end(), {broadcast_kv_store()});
         }
@@ -3312,6 +3339,137 @@ future<> system_keyspace::save_group0_upgrade_state(service::group0_upgrade_stat
     }();
 
     return set_scylla_local_param(GROUP0_UPGRADE_STATE_KEY, value);
+}
+
+future<service::topology_state_machine::topology_type> system_keyspace::load_topology_state() {
+    auto rs = co_await qctx->execute_cql(
+        format("SELECT * FROM system.{}", TOPOLOGY));
+    assert(rs);
+
+    service::topology_state_machine::topology_type ret;
+
+    if (rs->empty()) {
+        co_return ret;
+    }
+
+    for (auto& row : *rs) {
+        auto host_id = row.get_as<utils::UUID>("host_id");
+        auto datacenter = row.get_as<sstring>("datacenter");
+        auto rack = row.get_as<sstring>("rack");
+        auto release_version = row.get_as<sstring>("release_version");
+
+        service::node_state nstate = service::node_state_from_string(row.get_as<sstring>("node_state"));
+
+        std::optional<service::ring_state::replication_state> tstate;
+        if (row.has("replication_state")) {
+            tstate = service::replication_state_from_string(row.get_as<sstring>("replication_state"));
+        }
+
+        std::unordered_set<dht::token> t;
+
+        if (row.has("tokens")) {
+            auto blob = row.get_blob("tokens");
+            auto cdef = topology()->get_column_definition("tokens");
+            auto deserialized = cdef->type->deserialize(blob);
+            auto tokens = value_cast<set_type_impl::native_type>(deserialized);
+            t = decode_tokens(tokens);
+        }
+
+        std::optional<service::topology_request> req;
+
+        if (row.has("topology_request")) {
+            auto val = row.get_as<sstring>("topology_request");
+            try {
+                req = service::topology_request_from_string(val);
+            } catch (...) {
+                slogger.error("Error while loading topology request '{}'. It will be ignored: {}", val, std::current_exception());
+            }
+        }
+
+        std::optional<raft::server_id> replaced_id;
+        if (row.has("replaced_id")) {
+            replaced_id = raft::server_id(row.get_as<utils::UUID>("replaced_id"));
+        }
+
+        // if the node is requesting to replace another node or it is already replacing anothe node
+        // replaced_id has to be available
+        if ((nstate == service::node_state::replacing || (req && req == service::topology_request::replace)) && !replaced_id) {
+            on_internal_error(slogger, fmt::format("replaced_id is missing for a node {}", host_id));
+        }
+
+        // there cannot be tokens without state
+        assert(tstate || t.size() == 0);
+        std::unordered_map<raft::server_id, service::replica_state>* map;
+        if (nstate == service::node_state::normal) {
+            map = &ret.normal_nodes;
+        } else if (nstate == service::node_state::left) {
+            map = &ret.left_nodes;
+        } else if (nstate == service::node_state::none) {
+            map = &ret.new_nodes;
+        } else {
+            map = &ret.transition_nodes;
+        }
+        map->emplace(host_id, service::replica_state{nstate, std::move(datacenter), std::move(rack), std::move(release_version), replaced_id, req,
+            tstate ? std::optional<service::ring_state>(service::ring_state{*tstate, std::move(t)}) : std::nullopt});
+    }
+
+    co_return ret;
+}
+
+system_keyspace::topology_mutation_builder::topology_mutation_builder(int64_t ts, raft::server_id id) :
+        _s(topology()),
+        _m(_s, partition_key::from_singular(*_s, id.uuid())),
+        _ts(ts),
+        _r(_m.partition().clustered_row(*_s, clustering_key::make_empty())) {
+            _r.apply(row_marker(_ts));
+}
+
+system_keyspace::topology_mutation_builder& system_keyspace::topology_mutation_builder::set(const char* cell, const sstring& value) {
+    auto cdef = _s->get_column_definition(cell);
+    assert(cdef);
+    _r.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, _ts, cdef->type->decompose(value)));
+    return *this;
+}
+
+system_keyspace::topology_mutation_builder& system_keyspace::topology_mutation_builder::set(const char* cell, const raft::server_id& value) {
+    auto cdef = _s->get_column_definition(cell);
+    assert(cdef);
+    _r.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, _ts, cdef->type->decompose(value.uuid())));
+    return *this;
+}
+
+system_keyspace::topology_mutation_builder& system_keyspace::topology_mutation_builder::del(const char* cell) {
+    auto cdef = _s->get_column_definition(cell);
+    assert(cdef);
+    if (!cdef->type->is_multi_cell()) {
+        _r.cells().apply(*cdef, atomic_cell::make_dead(_ts, gc_clock::now()));
+    } else {
+        collection_mutation_description cm;
+        cm.tomb = tombstone{_ts, gc_clock::now()};
+        _r.cells().apply(*cdef, cm.serialize(*cdef->type));
+    }
+    return *this;
+}
+
+system_keyspace::topology_mutation_builder& system_keyspace::topology_mutation_builder::set(const char* cell, const std::unordered_set<dht::token>& tokens) {
+    auto cdef = _s->get_column_definition(cell);
+    assert(cdef);
+    collection_mutation_description cm;
+    if (tokens.size()) {
+        auto vtype = static_pointer_cast<const set_type_impl>(cdef->type)->get_elements_type();
+
+        cm.cells.reserve(tokens.size());
+
+        auto t = prepare_tokens(tokens);
+        for (auto&& value : t) {
+            cm.cells.emplace_back(vtype->decompose(value), atomic_cell::make_live(*bytes_type, _ts, bytes_view()));
+        }
+
+        _r.cells().apply(*cdef, cm.serialize(*cdef->type));
+    } else {
+        del(cell);
+    }
+    return *this;
 }
 
 sstring system_keyspace_name() {
