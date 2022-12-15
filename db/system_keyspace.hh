@@ -27,6 +27,8 @@
 #include "locator/host_id.hh"
 #include "service/raft/group0_fwd.hh"
 #include "tasks/task_manager.hh"
+#include "service/topology_change_sm.hh"
+#include "canonical_mutation.hh"
 
 namespace service {
 
@@ -140,6 +142,7 @@ public:
     static constexpr auto GROUP0_HISTORY = "group0_history";
     static constexpr auto DISCOVERY = "discovery";
     static constexpr auto BROADCAST_KV_STORE = "broadcast_kv_store";
+    static constexpr auto TOPOLOGY_CHANGES = "topology_changes";
 
     struct v3 {
         static constexpr auto BATCHES = "batches";
@@ -198,7 +201,7 @@ public:
         static schema_ptr batchlog();
     };
 
-    static constexpr const char* extra_durable_tables[] = { PAXOS, SCYLLA_LOCAL, RAFT, RAFT_SNAPSHOTS, RAFT_CONFIG, DISCOVERY, BROADCAST_KV_STORE };
+    static constexpr const char* extra_durable_tables[] = { PAXOS, SCYLLA_LOCAL, RAFT, RAFT_SNAPSHOTS, RAFT_CONFIG, DISCOVERY, BROADCAST_KV_STORE, TOPOLOGY_CHANGES };
 
     static bool is_extra_durable(const sstring& name);
 
@@ -224,6 +227,7 @@ public:
     static schema_ptr group0_history();
     static schema_ptr discovery();
     static schema_ptr broadcast_kv_store();
+    static schema_ptr topology_changes();
 
     static table_schema_version generate_schema_version(table_id table_id, uint16_t offset = 0);
 
@@ -440,6 +444,33 @@ public:
     // Checks whether the group 0 history table contains the given state ID.
     // Assumes that the history table exists, i.e. Raft experimental feature is enabled.
     static future<bool> group0_history_contains(utils::UUID state_id);
+
+    class topology_mutation_builder {
+        schema_ptr _s;
+        mutation _m;
+        int64_t _ts;
+        deletable_row& _r;
+    public:
+        topology_mutation_builder(int64_t ts, raft::server_id);
+        template<typename T>
+        topology_mutation_builder& set(const char* cell, const T& value) {
+            return set(cell, sstring{fmt::format("{}", value)});
+        }
+        template<typename T>
+        topology_mutation_builder& set(const char* cell, const std::optional<T>& value){
+            if (value) {
+                return set(cell, *value);
+            } else {
+                return set(cell, std::nullopt);
+            }
+        }
+        topology_mutation_builder& set(const char* cell, const sstring& value);
+        topology_mutation_builder& set(const char* cell, std::nullopt_t value);
+        topology_mutation_builder& set(const char* cell, const std::unordered_set<dht::token>& value);
+        mutation build() { return std::move(_m); }
+        canonical_mutation build_canonical() { return canonical_mutation{std::move(_m)}; }
+    };
+    static future<service::topology_change_sm::topology_type> load_topology_state();
 
     // The mutation appends the given state ID to the group 0 history table, with the given description if non-empty.
     //
