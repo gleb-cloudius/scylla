@@ -175,7 +175,7 @@ public:
         }
     }
 
-    small_vector(const small_vector& other) : small_vector() {
+    small_vector(const small_vector& other) requires(std::is_copy_constructible_v<T>) : small_vector() {
         reserve(other.size());
         _end = std::uninitialized_copy(other.begin(), other.end(), _end);
     }
