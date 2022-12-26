@@ -312,6 +312,9 @@ future<> storage_service::wait_for_ring_to_settle(std::chrono::milliseconds dela
 future<> storage_service::topology_change_state_load() {
     static bool running = false;
     assert(!running); // The function is not re-entrant
+    if (!_raft_topology_change_enabled) {
+        co_return;
+    }
     auto d = defer([] {
         running = false;
     });
@@ -857,13 +860,13 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
         if (_sys_ks.local().bootstrap_complete()) {
             throw std::runtime_error("Cannot replace address with a node that is already bootstrapped");
         }
-        auto ri = co_await prepare_replacement_info(initial_contact_nodes, loaded_peer_features, !_group0->is_raft_enabled());
+        auto ri = co_await prepare_replacement_info(initial_contact_nodes, loaded_peer_features, !_raft_topology_change_enabled);
         auto replace_address = get_replace_address();
         raft_replace_info = raft_group0::replace_info {
             .ip_addr = *replace_address,
             .raft_id = raft::server_id{ri.host_id.uuid()},
         };
-        if (!_group0->is_raft_enabled()) {
+        if (!_raft_topology_change_enabled) {
             bootstrap_tokens = std::move(ri.tokens);
             replacing_a_node_with_same_ip = *replace_address == get_broadcast_address();
             replacing_a_node_with_diff_ip = *replace_address != get_broadcast_address();
@@ -988,7 +991,7 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
     co_await _group0->setup_group0(_sys_ks.local(), initial_contact_nodes, raft_replace_info);
 
     raft::server* raft_server = co_await [this] () -> future<raft::server*> {
-        if (!_group0->is_raft_enabled()) {
+        if (!_raft_topology_change_enabled) {
             co_return nullptr;
         } else if (_sys_ks.local().bootstrap_complete()) {
             auto [upgrade_lock_holder, upgrade_state] = co_await _group0->client().get_group0_upgrade_state();
@@ -1455,7 +1458,7 @@ future<> storage_service::handle_state_bootstrap(inet_address endpoint) {
 future<> storage_service::handle_state_normal(inet_address endpoint) {
     slogger.debug("endpoint={} handle_state_normal", endpoint);
 
-    if (_group0->is_raft_enabled()) {
+    if (_raft_topology_change_enabled) {
         slogger.debug("ignore handle_state_normal since topology change are usin raft");
         co_return;
     }
@@ -1658,7 +1661,7 @@ future<> storage_service::handle_state_leaving(inet_address endpoint) {
 
 future<> storage_service::handle_state_left(inet_address endpoint, std::vector<sstring> pieces) {
 
-    if (_group0->is_raft_enabled()) {
+    if (_raft_topology_change_enabled) {
         slogger.debug("ignore handle_state_left since topology change are usin raft");
         co_return;
     }
@@ -2021,6 +2024,8 @@ future<> storage_service::join_cluster(cdc::generation_service& cdc_gen_service,
     assert(this_shard_id() == 0);
 
     _group0 = &group0;
+    _raft_topology_change_enabled = _group0->is_raft_enabled() && _db.local().get_config().check_experimental(db::experimental_features_t::feature::RAFT);
+
     return seastar::async([this, &cdc_gen_service, &sys_dist_ks, &proxy] {
         set_mode(mode::STARTING);
 
@@ -2200,7 +2205,7 @@ future<> storage_service::check_for_endpoint_collision(std::unordered_set<gms::i
             }
             if (_db.local().get_config().consistent_rangemovement() &&
                 // Raft is responsible for consistency, so in case it is enable no need to check here
-                !_db.local().get_config().check_experimental(db::experimental_features_t::feature::RAFT)) {
+                !_raft_topology_change_enabled) {
                 found_bootstrapping_node = false;
                 for (auto& x : _gossiper.get_endpoint_states()) {
                     auto state = _gossiper.get_gossip_status(x.second);
@@ -2608,7 +2613,7 @@ future<> storage_service::raft_decomission() {
 future<> storage_service::decommission() {
     return run_with_api_lock(sstring("decommission"), [] (storage_service& ss) {
         return seastar::async([&ss] {
-            if (ss._group0->is_raft_enabled()) {
+            if (ss._raft_topology_change_enabled) {
                 ss.raft_decomission().get();
             } else {
                 auto uuid = node_ops_id::create_random_id();
@@ -3085,7 +3090,7 @@ future<> storage_service::raft_removenode(locator::host_id host_id) {
 future<> storage_service::removenode(locator::host_id host_id, std::list<locator::host_id_or_endpoint> ignore_nodes_params) {
     return run_with_api_lock(sstring("removenode"), [host_id, ignore_nodes_params = std::move(ignore_nodes_params)] (storage_service& ss) mutable {
         return seastar::async([&ss, host_id, ignore_nodes_params = std::move(ignore_nodes_params)] () mutable {
-            if (ss._group0->is_raft_enabled()) {
+            if (ss._raft_topology_change_enabled) {
                 ss.raft_removenode(host_id).get();
                 return;
             }

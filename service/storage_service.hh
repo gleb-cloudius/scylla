@@ -774,6 +774,7 @@ public:
     bool is_repair_based_node_ops_enabled(streaming::stream_reason reason);
 
 private:
+    bool _raft_topology_change_enabled = false;
     future<> _raft_state_monitor = make_ready_future<>();
     // This fibers monitors raft state and start/stops the topology change
     // coordinator fiber
