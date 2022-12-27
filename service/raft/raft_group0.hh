@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include "service/raft/raft_address_map.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/discovery.hh"
 #include "service/raft/group0_fwd.hh"
