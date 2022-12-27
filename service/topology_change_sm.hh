@@ -85,6 +85,25 @@ struct topology_change_sm {
     condition_variable event;
 };
 
+// Raft leader uses this command to drive bootstrap process on other nodes
+struct raft_topology_cmd {
+      enum class command: uint8_t {
+          barrier,
+          stream_ranges,
+          fence_old_reads
+      };
+      command cmd;
+};
+
+// returned as a result of raft_bootstrap_cmd
+struct raft_topology_cmd_result {
+    enum class command_status: uint8_t {
+        fail,
+        success
+    };
+    command_status status = command_status::fail;
+};
+
 inline std::ostream& operator<<(std::ostream& os, tokens_state s) {
     switch (s) {
         case tokens_state::write_only:
@@ -127,4 +146,18 @@ inline std::ostream& operator<<(std::ostream& os, node_state s) {
     return os;
 }
 
+inline std::ostream& operator<<(std::ostream& os, const raft_topology_cmd::command& cmd) {
+    switch (cmd) {
+        case raft_topology_cmd::command::barrier:
+            os << "barrier";
+            break;
+        case raft_topology_cmd::command::stream_ranges:
+            os << "stream_ranges";
+            break;
+        case raft_topology_cmd::command::fence_old_reads:
+            os << "fence_old_reads";
+            break;
+    }
+    return os;
+}
 }
