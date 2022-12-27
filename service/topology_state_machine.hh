@@ -107,6 +107,26 @@ struct topology_state_machine {
     condition_variable event;
 };
 
+// Raft leader uses this command to drive bootstrap process on other nodes
+struct raft_topology_cmd {
+      enum class command: uint8_t {
+          barrier,         // request to wait for the latest topology
+          stream_ranges,   // reqeust to stream data, return when streaming is
+                           // done
+          fence_old_reads  // wait for all reads started before to complete
+      };
+      command cmd;
+};
+
+// returned as a result of raft_bootstrap_cmd
+struct raft_topology_cmd_result {
+    enum class command_status: uint8_t {
+        fail,
+        success
+    };
+    command_status status = command_status::fail;
+};
+
 static std::unordered_map<ring_slice::replication_state, sstring> replication_state_to_name_map = {
     {ring_slice::replication_state::write_both_read_old, "write both read old"},
     {ring_slice::replication_state::write_both_read_new, "write both read new"},
@@ -170,5 +190,20 @@ inline topology_request topology_request_from_string(const sstring& s) {
         }
     }
     throw std::runtime_error(fmt::format("cannot map name {} to topology_request", s));
+}
+
+inline std::ostream& operator<<(std::ostream& os, const raft_topology_cmd::command& cmd) {
+    switch (cmd) {
+        case raft_topology_cmd::command::barrier:
+            os << "barrier";
+            break;
+        case raft_topology_cmd::command::stream_ranges:
+            os << "stream_ranges";
+            break;
+        case raft_topology_cmd::command::fence_old_reads:
+            os << "fence_old_reads";
+            break;
+    }
+    return os;
 }
 }
