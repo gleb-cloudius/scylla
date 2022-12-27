@@ -43,6 +43,7 @@
 #include "cdc/generation_id.hh"
 #include "raft/raft.hh"
 #include "repair/id.hh"
+#include "service/topology_state_machine.hh"
 
 class node_ops_cmd_request;
 class node_ops_cmd_response;
@@ -759,6 +760,9 @@ private:
 public:
     future<bool> is_cleanup_allowed(sstring keyspace);
     bool is_repair_based_node_ops_enabled(streaming::stream_reason reason);
+
+private:
+    future<raft_topology_cmd_result> raft_topology_cmd_handler(sharded<db::system_distributed_keyspace>& sys_dist_ks, raft::term_t term, const raft_topology_cmd& cmd);
 };
 
 }

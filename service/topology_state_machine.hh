@@ -89,6 +89,25 @@ struct topology_state_machine {
     condition_variable event;
 };
 
+// Raft leader uses this command to drive bootstrap process on other nodes
+struct raft_topology_cmd {
+      enum class command: uint8_t {
+          barrier,
+          stream_ranges,
+          fence_old_reads
+      };
+      command cmd;
+};
+
+// returned as a result of raft_bootstrap_cmd
+struct raft_topology_cmd_result {
+    enum class command_status: uint8_t {
+        fail,
+        success
+    };
+    command_status status = command_status::fail;
+};
+
 static std::unordered_map<ring_state::replication_state, sstring> replication_state_to_name_map = {
     {ring_state::replication_state::write_only, "write only"},
     {ring_state::replication_state::read_write, "read write"},
@@ -152,5 +171,20 @@ inline topology_request topology_request_from_string(const sstring& s) {
         }
     }
     throw std::runtime_error(fmt::format("cannot map name {} to topology_request", s));
+}
+
+inline std::ostream& operator<<(std::ostream& os, const raft_topology_cmd::command& cmd) {
+    switch (cmd) {
+        case raft_topology_cmd::command::barrier:
+            os << "barrier";
+            break;
+        case raft_topology_cmd::command::stream_ranges:
+            os << "stream_ranges";
+            break;
+        case raft_topology_cmd::command::fence_old_reads:
+            os << "fence_old_reads";
+            break;
+    }
+    return os;
 }
 }
