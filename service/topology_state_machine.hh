@@ -21,6 +21,7 @@
 #include "raft/raft.hh"
 #include "utils/UUID.hh"
 #include "dht/i_partitioner.hh"
+#include "canonical_mutation.hh"
 
 namespace service {
 
@@ -98,6 +99,13 @@ struct topology {
                new_nodes.contains(id) ||
                left_nodes.contains(id);
     }
+};
+
+struct raft_topology_snapshot {
+    std::vector<canonical_mutation> mutations;
+};
+
+struct raft_topology_pull_params {
 };
 
 // State machine that is responsible for topology change
