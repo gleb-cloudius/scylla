@@ -874,16 +874,16 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
             .raft_id = raft::server_id{ri->host_id.uuid()},
         };
         if (!_raft_topology_change_enabled) {
-        bootstrap_tokens = std::move(ri->tokens);
-        replacing_a_node_with_same_ip = *replace_address == get_broadcast_address();
-        replacing_a_node_with_diff_ip = *replace_address != get_broadcast_address();
+            bootstrap_tokens = std::move(ri->tokens);
+            replacing_a_node_with_same_ip = *replace_address == get_broadcast_address();
+            replacing_a_node_with_diff_ip = *replace_address != get_broadcast_address();
 
-        slogger.info("Replacing a node with {} IP address, my address={}, node being replaced={}",
-            get_broadcast_address() == *replace_address ? "the same" : "a different",
-            get_broadcast_address(), *replace_address);
-        tmptr->update_topology(*replace_address, std::move(ri->dc_rack));
-        co_await tmptr->update_normal_tokens(bootstrap_tokens, *replace_address);
-        replaced_host_id = ri->host_id;
+            slogger.info("Replacing a node with {} IP address, my address={}, node being replaced={}",
+                get_broadcast_address() == *replace_address ? "the same" : "a different",
+                get_broadcast_address(), *replace_address);
+            tmptr->update_topology(*replace_address, std::move(ri->dc_rack));
+            co_await tmptr->update_normal_tokens(bootstrap_tokens, *replace_address);
+            replaced_host_id = ri->host_id;
         }
     } else if (should_bootstrap()) {
         co_await check_for_endpoint_collision(initial_contact_nodes, loaded_peer_features);
@@ -2619,154 +2619,154 @@ future<> storage_service::decommission() {
                 ss.raft_decomission().get();
                 raft_available = true;
             } else {
-            auto tmptr = ss.get_token_metadata_ptr();
-            auto& db = ss._db.local();
-            auto endpoint = ss.get_broadcast_address();
-            if (!tmptr->is_normal_token_owner(endpoint)) {
-                throw std::runtime_error("local node is not a member of the token ring yet");
-            }
-            // We assume that we're a member of group 0 if we're in decommission()` and Raft is enabled.
-            // We have no way to check that we're not a member: attempting to perform group 0 operations
-            // would simply hang in that case, the leader would refuse to talk to us.
-            // If we aren't a member then we shouldn't be here anyway, since it means that either
-            // an earlier decommission finished (leave_group0 is the last operation in decommission)
-            // or that we were removed using `removenode`.
-            //
-            // For handling failure scenarios such as a group 0 member that is not a token ring member,
-            // there's `removenode`.
-
-            auto temp = tmptr->clone_after_all_left().get0();
-            auto num_tokens_after_all_left = temp.sorted_tokens().size();
-            temp.clear_gently().get();
-            if (num_tokens_after_all_left < 2) {
-                throw std::runtime_error("no other normal nodes in the ring; decommission would be pointless");
-            }
-
-            if (ss._operation_mode != mode::NORMAL) {
-                throw std::runtime_error(format("Node in {} state; wait for status to become normal or restart", ss._operation_mode));
-            }
-
-            ss.update_pending_ranges(format("decommission {}", endpoint)).get();
-
-            auto non_system_keyspaces = db.get_non_local_strategy_keyspaces();
-            for (const auto& keyspace_name : non_system_keyspaces) {
-                if (ss.get_token_metadata().has_pending_ranges(keyspace_name, ss.get_broadcast_address())) {
-                    throw std::runtime_error("data is currently moving to this node; unable to leave the ring");
+                auto tmptr = ss.get_token_metadata_ptr();
+                auto& db = ss._db.local();
+                auto endpoint = ss.get_broadcast_address();
+                if (!tmptr->is_normal_token_owner(endpoint)) {
+                    throw std::runtime_error("local node is not a member of the token ring yet");
                 }
-            }
-
-            slogger.info("DECOMMISSIONING: starts");
-            auto leaving_nodes = std::list<gms::inet_address>{endpoint};
-            // TODO: wire ignore_nodes provided by user
-            std::list<gms::inet_address> ignore_nodes;
-
-            // Step 1: Decide who needs to sync data
-            std::list<gms::inet_address> nodes;
-            for (const auto& x : tmptr->get_endpoint_to_host_id_map_for_reading()) {
-                seastar::thread::maybe_yield();
-                if (std::find(ignore_nodes.begin(), ignore_nodes.end(), x.first) == ignore_nodes.end()) {
-                    nodes.push_back(x.first);
-                }
-            }
-            slogger.info("decommission[{}]: Started decommission operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-
-            std::unordered_set<gms::inet_address> gossip_nodes_down;
-            for (auto& node : nodes) {
-                if (!ss._gossiper.is_alive(node)) {
-                    gossip_nodes_down.emplace(node);
-                }
-            }
-            if (!gossip_nodes_down.empty()) {
-                auto msg = format("decommission[{}]: Rejected decommission operation, removing node={}, sync_nodes={}, ignore_nodes={}, nodes_down={}",
-                        uuid, endpoint, nodes, ignore_nodes, gossip_nodes_down);
-                slogger.warn("{}", msg);
-                throw std::runtime_error(msg);
-            }
-
-            assert(ss._group0);
-            raft_available = ss._group0->wait_for_raft().get();
-
-            // Step 2: Prepare to sync data
-            std::unordered_set<gms::inet_address> nodes_unknown_verb;
-            std::unordered_set<gms::inet_address> nodes_down;
-            auto req = node_ops_cmd_request{node_ops_cmd::decommission_prepare, uuid, ignore_nodes, leaving_nodes, {}};
-            try {
-                parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("decommission[{}]: Got prepare response from node={}", uuid, node);
-                    }).handle_exception_type([&nodes_unknown_verb, node, uuid] (seastar::rpc::unknown_verb_error&) {
-                        slogger.warn("decommission[{}]: Node {} does not support decommission verb", uuid, node);
-                        nodes_unknown_verb.emplace(node);
-                    }).handle_exception_type([&nodes_down, node, uuid] (seastar::rpc::closed_error&) {
-                        slogger.warn("decommission[{}]: Node {} is down for node_ops_cmd verb", uuid, node);
-                        nodes_down.emplace(node);
-                    });
-                }).get();
-                if (!nodes_unknown_verb.empty()) {
-                    auto msg = format("decommission[{}]: Nodes={} do not support decommission verb. Please upgrade your cluster and run decommission again.", uuid, nodes_unknown_verb);
-                    slogger.warn("{}", msg);
-                    throw std::runtime_error(msg);
-                }
-                if (!nodes_down.empty()) {
-                    auto msg = format("decommission[{}]: Nodes={} needed for decommission operation are down. It is highly recommended to fix the down nodes and try again.", uuid, nodes_down);
-                    slogger.warn("{}", msg);
-                    throw std::runtime_error(msg);
-                }
-
-                // Step 3: Start heartbeat updater
-                auto heartbeat_updater_done = make_lw_shared<bool>(false);
-                auto heartbeat_updater = ss.node_ops_cmd_heartbeat_updater(node_ops_cmd::decommission_heartbeat, uuid, nodes, heartbeat_updater_done);
-                auto stop_heartbeat_updater = defer([&] {
-                    *heartbeat_updater_done = true;
-                    heartbeat_updater.get();
-                });
-
-                // Step 4: Start to sync data
-                slogger.info("DECOMMISSIONING: unbootstrap starts");
-                ss.unbootstrap().get();
-                slogger.info("DECOMMISSIONING: unbootstrap done");
-
-                // Step 5: Become a group 0 non-voter before leaving the token ring.
+                // We assume that we're a member of group 0 if we're in decommission()` and Raft is enabled.
+                // We have no way to check that we're not a member: attempting to perform group 0 operations
+                // would simply hang in that case, the leader would refuse to talk to us.
+                // If we aren't a member then we shouldn't be here anyway, since it means that either
+                // an earlier decommission finished (leave_group0 is the last operation in decommission)
+                // or that we were removed using `removenode`.
                 //
-                // Thanks to this, even if we fail after leaving the token ring but before leaving group 0,
-                // group 0's availability won't be reduced.
-                if (raft_available) {
-                    slogger.info("decommission[{}]: becoming a group 0 non-voter", uuid);
-                    ss._group0->become_nonvoter().get();
-                    slogger.info("decommission[{}]: became a group 0 non-voter", uuid);
+                // For handling failure scenarios such as a group 0 member that is not a token ring member,
+                // there's `removenode`.
+
+                auto temp = tmptr->clone_after_all_left().get0();
+                auto num_tokens_after_all_left = temp.sorted_tokens().size();
+                temp.clear_gently().get();
+                if (num_tokens_after_all_left < 2) {
+                    throw std::runtime_error("no other normal nodes in the ring; decommission would be pointless");
                 }
 
-                // Step 6: Leave the token ring
-                slogger.info("decommission[{}]: leaving token ring", uuid);
-                ss.leave_ring().get();
-                left_token_ring = true;
-                slogger.info("decommission[{}]: left token ring", uuid);
+                if (ss._operation_mode != mode::NORMAL) {
+                    throw std::runtime_error(format("Node in {} state; wait for status to become normal or restart", ss._operation_mode));
+                }
 
-                // Step 7: Finish token movement
-                req.cmd = node_ops_cmd::decommission_done;
-                parallel_for_each(nodes, [&ss, &req, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("decommission[{}]: Got done response from node={}", uuid, node);
-                        return make_ready_future<>();
-                    });
-                }).get();
-                slogger.info("decommission[{}]: Finished token ring movement, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-            } catch (...) {
-                slogger.warn("decommission[{}]: Abort decommission operation started, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-                // we need to revert the effect of prepare verb the decommission ops is failed
-                req.cmd = node_ops_cmd::decommission_abort;
-                parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-                    if (nodes_unknown_verb.contains(node) || nodes_down.contains(node)) {
-                        // No need to revert previous prepare cmd for those who do not apply prepare cmd.
-                        return make_ready_future<>();
+                ss.update_pending_ranges(format("decommission {}", endpoint)).get();
+
+                auto non_system_keyspaces = db.get_non_local_strategy_keyspaces();
+                for (const auto& keyspace_name : non_system_keyspaces) {
+                    if (ss.get_token_metadata().has_pending_ranges(keyspace_name, ss.get_broadcast_address())) {
+                        throw std::runtime_error("data is currently moving to this node; unable to leave the ring");
                     }
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("decommission[{}]: Got abort response from node={}", uuid, node);
+                }
+
+                slogger.info("DECOMMISSIONING: starts");
+                auto leaving_nodes = std::list<gms::inet_address>{endpoint};
+                // TODO: wire ignore_nodes provided by user
+                std::list<gms::inet_address> ignore_nodes;
+
+                // Step 1: Decide who needs to sync data
+                std::list<gms::inet_address> nodes;
+                for (const auto& x : tmptr->get_endpoint_to_host_id_map_for_reading()) {
+                    seastar::thread::maybe_yield();
+                    if (std::find(ignore_nodes.begin(), ignore_nodes.end(), x.first) == ignore_nodes.end()) {
+                        nodes.push_back(x.first);
+                    }
+                }
+                slogger.info("decommission[{}]: Started decommission operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
+
+                std::unordered_set<gms::inet_address> gossip_nodes_down;
+                for (auto& node : nodes) {
+                    if (!ss._gossiper.is_alive(node)) {
+                        gossip_nodes_down.emplace(node);
+                    }
+                }
+                if (!gossip_nodes_down.empty()) {
+                    auto msg = format("decommission[{}]: Rejected decommission operation, removing node={}, sync_nodes={}, ignore_nodes={}, nodes_down={}",
+                            uuid, endpoint, nodes, ignore_nodes, gossip_nodes_down);
+                    slogger.warn("{}", msg);
+                    throw std::runtime_error(msg);
+                }
+
+                assert(ss._group0);
+                raft_available = ss._group0->wait_for_raft().get();
+
+                // Step 2: Prepare to sync data
+                std::unordered_set<gms::inet_address> nodes_unknown_verb;
+                std::unordered_set<gms::inet_address> nodes_down;
+                auto req = node_ops_cmd_request{node_ops_cmd::decommission_prepare, uuid, ignore_nodes, leaving_nodes, {}};
+                try {
+                    parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
+                        return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
+                            slogger.debug("decommission[{}]: Got prepare response from node={}", uuid, node);
+                        }).handle_exception_type([&nodes_unknown_verb, node, uuid] (seastar::rpc::unknown_verb_error&) {
+                            slogger.warn("decommission[{}]: Node {} does not support decommission verb", uuid, node);
+                            nodes_unknown_verb.emplace(node);
+                        }).handle_exception_type([&nodes_down, node, uuid] (seastar::rpc::closed_error&) {
+                            slogger.warn("decommission[{}]: Node {} is down for node_ops_cmd verb", uuid, node);
+                            nodes_down.emplace(node);
+                        });
+                    }).get();
+                    if (!nodes_unknown_verb.empty()) {
+                        auto msg = format("decommission[{}]: Nodes={} do not support decommission verb. Please upgrade your cluster and run decommission again.", uuid, nodes_unknown_verb);
+                        slogger.warn("{}", msg);
+                        throw std::runtime_error(msg);
+                    }
+                    if (!nodes_down.empty()) {
+                        auto msg = format("decommission[{}]: Nodes={} needed for decommission operation are down. It is highly recommended to fix the down nodes and try again.", uuid, nodes_down);
+                        slogger.warn("{}", msg);
+                        throw std::runtime_error(msg);
+                    }
+
+                    // Step 3: Start heartbeat updater
+                    auto heartbeat_updater_done = make_lw_shared<bool>(false);
+                    auto heartbeat_updater = ss.node_ops_cmd_heartbeat_updater(node_ops_cmd::decommission_heartbeat, uuid, nodes, heartbeat_updater_done);
+                    auto stop_heartbeat_updater = defer([&] {
+                        *heartbeat_updater_done = true;
+                        heartbeat_updater.get();
                     });
-                }).get();
-                slogger.warn("decommission[{}]: Abort decommission operation finished, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-                throw;
-            }
+
+                    // Step 4: Start to sync data
+                    slogger.info("DECOMMISSIONING: unbootstrap starts");
+                    ss.unbootstrap().get();
+                    slogger.info("DECOMMISSIONING: unbootstrap done");
+
+                    // Step 5: Become a group 0 non-voter before leaving the token ring.
+                    //
+                    // Thanks to this, even if we fail after leaving the token ring but before leaving group 0,
+                    // group 0's availability won't be reduced.
+                    if (raft_available) {
+                        slogger.info("decommission[{}]: becoming a group 0 non-voter", uuid);
+                        ss._group0->become_nonvoter().get();
+                        slogger.info("decommission[{}]: became a group 0 non-voter", uuid);
+                    }
+
+                    // Step 6: Leave the token ring
+                    slogger.info("decommission[{}]: leaving token ring", uuid);
+                    ss.leave_ring().get();
+                    left_token_ring = true;
+                    slogger.info("decommission[{}]: left token ring", uuid);
+
+                    // Step 7: Finish token movement
+                    req.cmd = node_ops_cmd::decommission_done;
+                    parallel_for_each(nodes, [&ss, &req, uuid] (const gms::inet_address& node) {
+                        return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
+                            slogger.debug("decommission[{}]: Got done response from node={}", uuid, node);
+                            return make_ready_future<>();
+                        });
+                    }).get();
+                    slogger.info("decommission[{}]: Finished token ring movement, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
+                } catch (...) {
+                    slogger.warn("decommission[{}]: Abort decommission operation started, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
+                    // we need to revert the effect of prepare verb the decommission ops is failed
+                    req.cmd = node_ops_cmd::decommission_abort;
+                    parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
+                        if (nodes_unknown_verb.contains(node) || nodes_down.contains(node)) {
+                            // No need to revert previous prepare cmd for those who do not apply prepare cmd.
+                            return make_ready_future<>();
+                        }
+                        return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
+                            slogger.debug("decommission[{}]: Got abort response from node={}", uuid, node);
+                        });
+                    }).get();
+                    slogger.warn("decommission[{}]: Abort decommission operation finished, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
+                    throw;
+                }
             }
 
             // Step 8: Leave group 0
