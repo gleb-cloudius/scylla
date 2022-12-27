@@ -183,7 +183,7 @@ public:
 
     // Needed by distributed<>
     future<> stop();
-    void init_messaging_service();
+    void init_messaging_service(sharded<service::storage_proxy>& proxy, sharded<db::system_distributed_keyspace>& sys_dist_ks);
     future<> uninit_messaging_service();
 
 private:
@@ -319,7 +319,7 @@ public:
      * API.
      * \see init_server_without_the_messaging_service_part
      */
-    future<> init_messaging_service_part();
+    future<> init_messaging_service_part(sharded<service::storage_proxy>& proxy, sharded<db::system_distributed_keyspace>& sys_dist_ks);
     /*!
      * \brief Uninit the messaging service part of the service.
      */
