@@ -763,6 +763,10 @@ public:
 
 private:
     future<raft_topology_cmd_result> raft_topology_cmd_handler(sharded<db::system_distributed_keyspace>& sys_dist_ks, raft::term_t term, const raft_topology_cmd& cmd);
+
+public:
+    // Applies received raft snapshot to local state machine persistent storage
+    future<> merge_topology_snapshot(raft_topology_snapshot snp);
 };
 
 }

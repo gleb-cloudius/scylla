@@ -21,6 +21,7 @@
 #include "raft/raft.hh"
 #include "utils/UUID.hh"
 #include "dht/i_partitioner.hh"
+#include "canonical_mutation.hh"
 
 namespace service {
 
@@ -80,6 +81,13 @@ struct topology {
                                     boost::range::join(new_nodes, left_nodes)));
         return boost::find_if(range, [id] (auto& e) { return e.first == id; }) != range.end();
     }
+};
+
+struct raft_topology_snapshot {
+    std::vector<canonical_mutation> mutations;
+};
+
+struct raft_topology_pull_params {
 };
 
 // State machine that is responsible for topology change
