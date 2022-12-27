@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 #pragma once
+#include "service/raft/raft_address_map.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/discovery.hh"
 #include "service/raft/group0_fwd.hh"
@@ -182,6 +183,15 @@ public:
     // Remove the node from raft config, retries raft::commit_status_unknown.
     future<> remove_from_raft_config(raft::server_id id);
 
+    raft_group0_client& client() {
+        return _client;
+    }
+
+    raft::server& group0_server() {
+        return _raft_gr.group0();
+    }
+
+    const raft_address_map& address_map() const;
 private:
     static void init_rpc_verbs(raft_group0& shard0_this);
     static future<> uninit_rpc_verbs(netw::messaging_service& ms);
