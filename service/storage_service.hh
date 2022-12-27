@@ -43,6 +43,7 @@
 #include "cdc/generation_id.hh"
 #include "raft/raft.hh"
 #include "repair/id.hh"
+#include "raft/server.hh"
 #include "service/topology_state_machine.hh"
 
 class node_ops_cmd_request;
@@ -762,6 +763,16 @@ public:
     bool is_repair_based_node_ops_enabled(streaming::stream_reason reason);
 
 private:
+    // This fibers monitors raft state and start/stops the topology change
+    // coordinator fiber
+    future<> raft_state_monitor_fiber(raft::server&, sharded<db::system_distributed_keyspace>& sys_dist_ks);
+
+     // State machine that is responsible for topology change
+    topology_state_machine _topology_state_machine;
+
+    future<> _topology_change_coordinator = make_ready_future<>();
+    future<> topology_change_coordinator_fiber(raft::server&, sharded<db::system_distributed_keyspace>&, abort_source&);
+
     future<raft_topology_cmd_result> raft_topology_cmd_handler(sharded<db::system_distributed_keyspace>& sys_dist_ks, raft::term_t term, const raft_topology_cmd& cmd);
 
 public:
