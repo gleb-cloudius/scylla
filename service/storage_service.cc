@@ -13,6 +13,7 @@
 #include "dht/boot_strapper.hh"
 #include <seastar/core/distributed.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/coroutine/as_future.hh>
 #include "locator/snitch_base.hh"
 #include "locator/production_snitch_base.hh"
 #include "db/system_keyspace.hh"
@@ -279,7 +280,117 @@ future<> storage_service::wait_for_ring_to_settle(std::chrono::milliseconds dela
 }
 
 future<> storage_service::topology_state_load() {
-    co_return;
+#ifdef SEASTAR_DEBUG
+    static bool running = false;
+    assert(!running); // The function is not re-entrant
+    auto d = defer([] {
+        running = false;
+    });
+    running = true;
+#endif
+
+    if (!_raft_topology_change_enabled) {
+        co_return;
+    }
+
+    slogger.debug("raft topology: reload raft topology state");
+    // read topology state from disk and recreate token_metadata from it
+    _topology_state_machine._topology = co_await db::system_keyspace::load_topology_state();
+
+    const auto& am = _group0->address_map();
+    auto id2ip = [this, &am] (raft::server_id id) -> future<gms::inet_address> {
+        auto ip = am.find(id);
+        while (!ip) {
+            static logger::rate_limit rate_limit{std::chrono::seconds(1)};
+            slogger.log(log_level::warn, rate_limit, "raft topology: cannot map {} to ip, retrying.", id);
+            // FIXME: https://github.com/scylladb/scylladb/issues/12279
+            // Loop until gossiper figures the address
+            // but the solution is to change token_metadata to work with server_ids instead of ips
+            co_await sleep_abortable(std::chrono::milliseconds(5), _abort_source);
+            ip = am.find(id);
+        }
+        co_return *ip;
+    };
+
+    for (const auto& id: _topology_state_machine._topology.left_nodes) {
+        auto ip = co_await id2ip(id);
+        if (_gossiper.get_live_members().contains(ip) || _gossiper.get_unreachable_members().contains(ip)) {
+            co_await remove_endpoint(ip);
+        }
+    }
+
+    co_await mutate_token_metadata(seastar::coroutine::lambda([this, &id2ip, &am] (mutable_token_metadata_ptr tmptr) -> future<> {
+        co_await tmptr->clear_gently(); // drop previous state
+
+        for (const auto& [id, rs]: _topology_state_machine._topology.normal_nodes) {
+            assert (rs.ring.value().state == ring_slice::ring_slice::replication_state::owner);
+
+            locator::host_id host_id{id.uuid()};
+            auto ip = co_await id2ip(id);
+
+            slogger.trace("raft topology: loading topology: raft id={} ip={} node state={} dc={} rack={} tokens state={} tokens={}",
+                          id, ip, rs.state, rs.datacenter, rs.rack, rs.ring.value().state, rs.ring.value().tokens);
+            // Save tokens, not needed for raft topology management, but needed by legacy
+            // Also ip -> id mapping is needed for address map recreation on reboot
+            if (!utils::fb_utilities::is_me(ip)) {
+                co_await _sys_ks.local().update_tokens(ip, rs.ring.value().tokens);
+                co_await _sys_ks.local().update_peer_info(ip, "data_center", rs.datacenter);
+                co_await _sys_ks.local().update_peer_info(ip, "rack", rs.rack);
+                co_await _sys_ks.local().update_peer_info(ip, "host_id", id.uuid());
+                co_await _sys_ks.local().update_peer_info(ip, "release_version", rs.release_version);
+            } else {
+                co_await _sys_ks.local().update_tokens(rs.ring.value().tokens);
+                co_await _gossiper.add_local_application_state({{ gms::application_state::STATUS, gms::versioned_value::normal(rs.ring.value().tokens) }});
+            }
+            tmptr->update_topology(ip, locator::endpoint_dc_rack{rs.datacenter, rs.rack});
+            co_await tmptr->update_normal_tokens(rs.ring.value().tokens, ip);
+            tmptr->update_host_id(host_id, ip);
+        }
+
+        for (const auto& [id, rs]: _topology_state_machine._topology.transition_nodes) {
+            locator::host_id host_id{id.uuid()};
+            auto ip = co_await id2ip(id);
+
+            slogger.trace("raft topology: loading topology: raft id={} ip={} node state={} dc={} rack={} tokens state={} tokens={}",
+                          id, ip, rs.state, rs.datacenter, rs.rack, rs.ring->state, rs.ring->tokens);
+
+            switch (rs.state) {
+            case node_state::bootstrapping:
+                if (!utils::fb_utilities::is_me(ip)) {
+                    // Save ip -> id mapping in peers table because we need it on restart, but do not save tokens until owned
+                    co_await _sys_ks.local().update_tokens(ip, {});
+                    co_await _sys_ks.local().update_peer_info(ip, "host_id", id.uuid());
+                }
+                tmptr->update_topology(ip, locator::endpoint_dc_rack{rs.datacenter, rs.rack});
+                tmptr->add_bootstrap_tokens(rs.ring.value().tokens, ip);
+                co_await update_pending_ranges(tmptr, format("bootstrapping node {}/{}", id, ip));
+                break;
+            case node_state::decommissioning:
+            case node_state::removing:
+                tmptr->update_topology(ip, locator::endpoint_dc_rack{rs.datacenter, rs.rack});
+                co_await tmptr->update_normal_tokens(rs.ring.value().tokens, ip);
+                tmptr->update_host_id(host_id, ip);
+                tmptr->add_leaving_endpoint(ip);
+                co_await update_pending_ranges(tmptr, format("{} {}/{}", rs.state, id, ip));
+                break;
+            case node_state::replacing: {
+                auto replaced_id = rs.replaced_id.value();
+                auto existing_ip = am.find(replaced_id);
+                if (!existing_ip) {
+                    // FIXME: What if not known?
+                    on_fatal_internal_error(slogger, format("Cannot map id of a node being replaced {} to its ip", replaced_id));
+                }
+                assert(existing_ip);
+                tmptr->update_topology(ip, locator::endpoint_dc_rack{rs.datacenter, rs.rack});
+                tmptr->add_replacing_endpoint(*existing_ip, ip);
+                co_await update_pending_ranges(tmptr, format("replacing {}/{} by {}/{}", replaced_id, *existing_ip, id, ip));
+            }
+            break;
+            default:
+                on_fatal_internal_error(slogger, format("Unexpected state {} for node {}", rs.state, id));
+            }
+        }
+    }));
 }
 
 future<> storage_service::topology_transition(storage_proxy& proxy, gms::inet_address from, std::vector<canonical_mutation> cms) {
@@ -321,8 +432,292 @@ future<> storage_service::topology_change_coordinator_fiber(raft::server& raft, 
         _topology_state_machine.event.signal();
     });
 
+    const auto& am = _group0->address_map();
+
+    struct topology_snapshot {
+        group0_guard guard;
+        const topology_state_machine::topology_type& topology;
+        raft::server_id id;
+        const replica_state& rs;
+        std::optional<topology_request> request;
+    };
+
+    auto update_replica_state = [this] (topology_snapshot&& node, std::vector<canonical_mutation>&& updates, const sstring& reason) -> future<> {
+        try {
+            slogger.trace("raft topology: do update {} reason {}", updates, reason);
+            topology_change change{std::move(updates)};
+            group0_command g0_cmd = _group0->client().prepare_command(std::move(change), node.guard, reason);
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(node.guard));
+        } catch (group0_concurrent_modification&) {
+            slogger.info("raft topology: race while changing state: {}. Retrying", reason);
+            throw;
+        }
+    };
+
+    auto exec_direct_command = [this, &am, &sys_dist_ks, &raft] (raft::server_id id, const raft_topology_cmd& cmd) -> future<> {
+        auto ip = am.find(id);
+        if (!ip) {
+            slogger.info("raft topology: cannot send command {} to {} because mapping to ip is not available", cmd.cmd, id);
+            co_await coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format("no ip address mapping for {}", id))));
+        }
+        slogger.trace("raft topology: send {} command to {}/{}", cmd.cmd, id, *ip);
+        auto result = utils::fb_utilities::is_me(*ip) ?
+                    co_await raft_topology_cmd_handler(sys_dist_ks, raft.get_current_term(), cmd) :
+                    co_await ser::storage_service_rpc_verbs::send_raft_topology_cmd(&_messaging.local(), netw::msg_addr{*ip}, raft.get_current_term(), cmd);
+        if (result.status == raft_topology_cmd_result::command_status::fail) {
+            co_await coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format("failed status returned from {}/{}", id, *ip))));
+        }
+    };
+
+    auto exec_global_command = [this, &exec_direct_command] (const topology_state_machine::topology_type& topo, const raft_topology_cmd& cmd, bool include_local, raft::server_id exclude_node) -> future<bool> {
+        auto nodes = topo.normal_nodes
+                | boost::adaptors::filtered([this, include_local, exclude_node] (const std::pair<const raft::server_id, replica_state>& n)  {
+                    return (include_local || n.first != _group0->group0_server().id()) && n.first != exclude_node;
+                }) | boost::adaptors::map_keys;
+        auto f = co_await coroutine::as_future(seastar::parallel_for_each(std::move(nodes), [&cmd, &exec_direct_command] (raft::server_id id) {
+            return exec_direct_command(id, cmd);
+        }));
+        if (f.failed()) {
+            slogger.error("raft topology: send_raft_topology_cmd({}) failed with {}", cmd.cmd, f.get_exception());
+            co_return false;
+        } else {
+            co_return true;
+        }
+    };
+
+    auto handle_ring_transition = [&] (topology_snapshot&& node) -> future<> {
+        raft::server_id replaced_node;
+
+        if (node.rs.state == node_state::replacing) {
+            replaced_node = node.rs.replaced_id.value();
+        }
+
+        switch (node.rs.ring.value().state) {
+            case ring_slice::ring_slice::replication_state::write_both_read_old: {
+                // make sure all nodes know about new topology (we require all nodes to be alive for topo change for now)
+                if (!co_await exec_global_command(node.topology, raft_topology_cmd{raft_topology_cmd::command::barrier}, false, replaced_node)) {
+                    break;
+                }
+                raft_topology_cmd cmd{raft_topology_cmd::command::stream_ranges};
+                if (node.rs.state == node_state::removing) {
+                    // tell all nodes to stream data of the removed node to new range owners
+                    if (!co_await exec_global_command(node.topology, cmd, true, replaced_node)) {
+                        slogger.error("raft topology: send_raft_topology_cmd(stream_ranges) failed during removenode");
+                        break;
+                    }
+                } else {
+                    // Tell joining/leaving/replacing node to stream its ranges
+                    try {
+                        co_await exec_direct_command(node.id, cmd);
+                    } catch (...) {
+                        slogger.error("raft topology: send_raft_topology_cmd(stream_ranges) failed with exception (node state is {}): {}", node.rs.state, std::current_exception());
+                        break;
+                    }
+                }
+                // Streaming completed. We can now move tokens state to ring_slice::ring_slice::replication_state::write_both_read_new
+                db::system_keyspace::topology_mutation_builder builder(node.guard.write_timestamp(), node.id);
+                builder.set("replication_state", ring_slice::replication_state::write_both_read_new);
+                auto str = fmt::format("{}: streaming completed", node.rs.state);
+                co_await update_replica_state(std::move(node), {builder.build()}, std::move(str));
+            }
+                break;
+            case ring_slice::replication_state::write_both_read_new:
+                // In this state writes goes to old and new replicas but reads start to be done from new replicas
+                // Before we stop writing to old replicas we need to wait for all previous reads to complete
+                if (!co_await exec_global_command(node.topology, raft_topology_cmd{raft_topology_cmd::command::fence_old_reads}, true, replaced_node)) {
+                    break;
+                }
+                switch(node.rs.state) {
+                case node_state::bootstrapping: {
+                    db::system_keyspace::topology_mutation_builder builder(node.guard.write_timestamp(), node.id);
+                    builder.set("replication_state", ring_slice::replication_state::owner)
+                           .set("node_state", node_state::normal);
+                    co_await update_replica_state(std::move(node), {builder.build()}, "bootstrap: read fence completed");
+                    }
+                    break;
+                case node_state::decommissioning:
+                case node_state::removing: {
+                    db::system_keyspace::topology_mutation_builder builder(node.guard.write_timestamp(), node.id);
+                    builder.del("replication_state")
+                           .del("tokens")
+                           .set("node_state", node_state::left);
+                    auto str = fmt::format("{}: read fence completed", node.rs.state);
+                    co_await update_replica_state(std::move(node), {builder.build()}, std::move(str));
+                    }
+                    break;
+                case node_state::replacing: {
+                    db::system_keyspace::topology_mutation_builder builder1(node.guard.write_timestamp(), node.id);
+                    // Move new node to 'normal'
+                    builder1.set("replication_state", ring_slice::replication_state::owner)
+                            .set("node_state", node_state::normal);
+
+                    // Move old node to 'left'
+                    db::system_keyspace::topology_mutation_builder builder2(node.guard.write_timestamp(), replaced_node);
+                    builder2.del("replication_state")
+                            .del("tokens")
+                            .set("node_state", node_state::left);
+                    co_await update_replica_state(std::move(node), {builder1.build(), builder2.build()}, "replace: read fence completed");
+                    }
+                    break;
+                default:
+                    on_fatal_internal_error(slogger, format("Ring state on node {} is write_both_read_new while the node is in state {}", node.id, node.rs.state));
+                }
+                // Reads are fenced. We can now move tokens state to ring_slice::replication_state::owner and node to normal
+                break;
+            case ring_slice::replication_state::owner:
+                // should not get here
+                on_fatal_internal_error(slogger, format("Tried to handle ring state transition on node {} while in 'owner' state", node.id));
+                break;
+        }
+    };
+
+    auto handle_node_transition = [this, &handle_ring_transition, &update_replica_state] (topology_snapshot&& node) -> future<> {
+        slogger.info("raft topology: coordinator fiber found a node to work on id={} state={}", node.id, node.rs.state);
+
+        switch (node.rs.state) {
+            case node_state::normal:
+            case node_state::none: {
+                // if the state is none there have to be either 'join' or 'replace' request
+                // if the state is normal there have to be either 'leave' or 'remove' request
+                db::system_keyspace::topology_mutation_builder builder(node.guard.write_timestamp(), node.id);
+                switch (node.request.value()) {
+                    case topology_request::join: {
+                        assert(!node.rs.ring);
+                        // A node just joined and does not have tokens assigned yet
+                        // Need to assign random tokens to the node (FIXME? we use local config for num_tokens)
+                        auto tmptr = get_token_metadata_ptr();
+                        auto bootstrap_tokens = boot_strapper::get_random_bootstrap_tokens(tmptr, _db.local().get_config(), dht::check_token_endpoint::yes);
+
+                        // Write choosen tokens through raft.
+                        builder.set("node_state", node_state::bootstrapping)
+                                .del("topology_request")
+                                .set("tokens", bootstrap_tokens)
+                                .set("replication_state", ring_slice::replication_state::write_both_read_old);
+                        co_await update_replica_state(std::move(node), {builder.build()}, "bootstrap: assign tokens");
+                        break;
+                        }
+                    case topology_request::leave:
+                        assert(node.rs.ring);
+                        // start decommission and put tokens of decommissioning nodes into write_both_read_old state
+                        // meaning that reads will go to the replica being decommissioned but writes will go to new owner as well
+                        builder.set("node_state", node_state::decommissioning)
+                                .del("topology_request")
+                                .set("replication_state", ring_slice::replication_state::write_both_read_old);
+                        co_await update_replica_state(std::move(node), {builder.build()}, "start decommission");
+                        break;
+                    case topology_request::remove:
+                        assert(node.rs.ring);
+                        // start removing and put tokens of a node been removed into write_both_read_old state
+                        // meaning that reads will go to the replica being removed (it is dead though) but writes will go to new owner as well
+                        builder.set("node_state", node_state::removing)
+                                .del("topology_request")
+                                .set("replication_state", ring_slice::replication_state::write_both_read_old);
+                        co_await update_replica_state(std::move(node), {builder.build()}, "start removenode");
+                        break;
+                    case topology_request::replace: {
+                        assert(!node.rs.ring);
+                        auto replaced_id = node.rs.replaced_id.value();
+                        auto it = _topology_state_machine._topology.normal_nodes.find(replaced_id);
+                        assert(it != _topology_state_machine._topology.normal_nodes.end());
+                        assert(it->second.ring && it->second.state == node_state::normal);
+                        // start replacing and take ownership of the tokens of a node been replaced and put them into write_both_read_old state
+                        // meaning that reads will go to the replica being removed (it is dead though) but writes will go to new owner as well
+                        builder.set("node_state", node_state::replacing)
+                                .del("topology_request")
+                                .set("tokens", it->second.ring->tokens)
+                                .set("replication_state", ring_slice::replication_state::write_both_read_old);
+                        co_await update_replica_state(std::move(node), {builder.build()}, "start replace");
+                        break;
+                        }
+                }
+                break;
+            }
+            case node_state::bootstrapping:
+            case node_state::decommissioning:
+            case node_state::removing:
+            case node_state::replacing:
+                co_await handle_ring_transition(std::move(node));
+                break;
+            case node_state::left:
+                // Should not get here
+                on_fatal_internal_error(slogger, format("Topology coordinator is called for node {} in state 'left'", node.id));
+                break;
+        }
+    };
+
+    auto get_node_to_work_on = [this] (abort_source& as) -> future<std::optional<topology_snapshot>> {
+        auto guard = co_await _group0->client().start_operation(&as);
+
+        auto& topo = _topology_state_machine._topology;
+
+        const raft::configuration& rconf = _group0->group0_server().get_configuration();
+
+        if (rconf.current.size() > topo.normal_nodes.size() + topo.new_nodes.size() + topo.transition_nodes.size()) {
+            // Raft config is larger than the sum of all nodes not in 'left' state.
+            // Find nodes that 'left' but still in the config and remove them
+            co_await coroutine::parallel_for_each(topo.left_nodes
+                                                    | boost::adaptors::filtered([&rconf] (raft::server_id id) { return rconf.contains(id); }),
+            [&] (raft::server_id id) -> future<> {
+                // Remove from group 0 nodes that left. They may failed to do so by themselves
+                try {
+                    slogger.trace("raft topology: topology coordinator fiber removing {} from the raft since it is in `left` state", id);
+                    co_await _group0->group0_server().modify_config({}, {id}, &as);
+                } catch (const raft::commit_status_unknown&) {
+                    slogger.trace("raft topology: topology coordinator fiber got unknown status while removing {} from the raft", id);
+                }
+            });
+        }
+
+        auto it = topo.transition_nodes.end();
+
+        std::optional<topology_request> req;
+        if (topo.transition_nodes.size() != 0) {
+            // If there is a node that is the middle of topology operation continue with it
+            it = topo.transition_nodes.begin();
+        } else if (topo.new_nodes.size() != 0) {
+            // Otherwise check if there is a new node that wants to be joined
+            it = topo.new_nodes.begin();
+            req = topo.requests[it->first];
+        } else if (!topo.requests.empty()) {
+            // If there is no new node but request queue is not empty there is a request for normal node
+            req = topo.requests.begin()->second;
+            it = topo.normal_nodes.find(topo.requests.begin()->first);
+        }
+
+        if (it == topo.normal_nodes.end()) {
+            co_return std::nullopt;
+        }
+
+        co_return topology_snapshot{std::move(guard), topo, it->first, it->second, std::move(req)};
+    };
+
+    bool wait_for_event = false;
+
     while (!as.abort_requested()) {
-        co_await _topology_state_machine.event.when();
+        try {
+            if (wait_for_event) {
+                slogger.trace("raft topology: topology coordinator fiber has nothing to do. Sleeping.");
+                co_await _topology_state_machine.event.when();
+                slogger.trace("raft topology: topology coordinator fiber got an event");
+                wait_for_event = false;
+            }
+
+            auto node = co_await get_node_to_work_on(as);
+
+            if (!node) {
+                // No nodes to work on. Wait for topology change event.
+                wait_for_event = true;
+                continue;
+            }
+
+            co_await handle_node_transition(std::move(*node));
+        } catch (raft::request_aborted&) {
+            slogger.debug("raft topology: topology change coordinator fiber aborted");
+        } catch (group0_concurrent_modification&) {
+        } catch (...) {
+            slogger.error("raft topology: topology change coordinator fiber got error {}", std::current_exception());
+        }
+        co_await coroutine::maybe_yield();
     }
 }
 
@@ -351,6 +746,76 @@ future<> storage_service::raft_state_monitor_fiber(raft::server& raft, sharded<d
     if (as) {
         as->request_abort(); // abort current coordinator if running
         co_await std::move(_topology_change_coordinator);
+    }
+}
+
+
+future<> storage_service::raft_replace(raft::server& raft_server, raft::server_id replaced_id, gms::inet_address replaced_ip) {
+    // Read barrier to access the latest topology. Quorum of nodes has to be alive.
+    co_await raft_server.read_barrier(&_abort_source);
+
+    auto it = _topology_state_machine._topology.find(raft_server.id());
+    if (it && it->second.state != node_state::replacing) {
+        throw std::runtime_error(fmt::format("Cannot do \"replace address\" operation with a node that is in state: {}", it->second.state));
+    }
+
+    // add myself to topology with request to replace
+    while (!_topology_state_machine._topology.contains(raft_server.id())) {
+        slogger.info("raft topology: adding myself to topology for replace: {} replacing {}", raft_server.id(), replaced_id);
+        auto guard = co_await _group0->client().start_operation(&_abort_source);
+
+        auto it = _topology_state_machine._topology.normal_nodes.find(replaced_id);
+        if (it == _topology_state_machine._topology.normal_nodes.end()) {
+            throw std::runtime_error(fmt::format("Cannot replace node {}/{} because it is not in the 'normal' state", replaced_ip, replaced_id));
+        }
+
+        auto& rs = it->second;
+        db::system_keyspace::topology_mutation_builder builder(guard.write_timestamp(), raft_server.id());
+        builder.set("node_state", node_state::none)
+               .set("datacenter", rs.datacenter)
+               .set("rack", rs.rack)
+               .set("release_version", version::release())
+               .set("topology_request", topology_request::replace)
+               .set("replaced_id", replaced_id);
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, fmt::format("replace {}/{}: add myself to topology", replaced_id, replaced_ip));
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), &_abort_source);
+        } catch (group0_concurrent_modification&) {
+            slogger.info("raft topology: replace: concurrent operation is detected, retrying.");
+        }
+    }
+
+    co_return;
+}
+
+future<> storage_service::raft_bootstrap(raft::server& raft_server) {
+    // We try to find ourself in the topology without doing read barrier
+    // first to not require quorum of live nodes during regular boot. But
+    // if we are not in the topology it either means this is the first boot
+    // or we failed during bootstrap so do a read barrier (which requires
+    // quorum to be alive) and re-check.
+    if (!_topology_state_machine._topology.contains(raft_server.id())) {
+        co_await raft_server.read_barrier(&_abort_source);
+    }
+
+    while (!_topology_state_machine._topology.contains(raft_server.id())) {
+        slogger.info("raft topology: adding myself to topology: {}", raft_server.id());
+        // Current topology does not contains this node. Bootstrap is needed!
+        auto guard = co_await _group0->client().start_operation(&_abort_source);
+        db::system_keyspace::topology_mutation_builder builder(guard.write_timestamp(), raft_server.id());
+        builder.set("node_state", node_state::none)
+               .set("datacenter", _snitch.local()->get_datacenter())
+               .set("rack", _snitch.local()->get_rack())
+               .set("release_version", version::release())
+               .set("topology_request", topology_request::join);
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, "bootstrap: add myself to topology");
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), &_abort_source);
+        } catch (group0_concurrent_modification&) {
+            slogger.info("raft topology: bootstrap: concurrent operation is detected, retrying.");
+        }
     }
 }
 
@@ -403,8 +868,13 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
             throw std::runtime_error("Cannot replace address with a node that is already bootstrapped");
         }
         ri = co_await prepare_replacement_info(initial_contact_nodes, loaded_peer_features);
-        bootstrap_tokens = std::move(ri->tokens);
         replace_address = ri->address;
+        raft_replace_info = raft_group0::replace_info {
+            .ip_addr = *replace_address,
+            .raft_id = raft::server_id{ri->host_id.uuid()},
+        };
+        if (!_raft_topology_change_enabled) {
+        bootstrap_tokens = std::move(ri->tokens);
         replacing_a_node_with_same_ip = *replace_address == get_broadcast_address();
         replacing_a_node_with_diff_ip = *replace_address != get_broadcast_address();
 
@@ -414,10 +884,7 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
         tmptr->update_topology(*replace_address, std::move(ri->dc_rack));
         co_await tmptr->update_normal_tokens(bootstrap_tokens, *replace_address);
         replaced_host_id = ri->host_id;
-        raft_replace_info = raft_group0::replace_info {
-            .ip_addr = *replace_address,
-            .raft_id = raft::server_id{ri->host_id.uuid()},
-        };
+        }
     } else if (should_bootstrap()) {
         co_await check_for_endpoint_collision(initial_contact_nodes, loaded_peer_features);
     } else {
@@ -530,6 +997,21 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
     assert(_group0);
     co_await _group0->setup_group0(_sys_ks.local(), initial_contact_nodes, raft_replace_info);
 
+    raft::server* raft_server = co_await [this] () -> future<raft::server*> {
+        if (!_raft_topology_change_enabled) {
+            co_return nullptr;
+        } else if (_sys_ks.local().bootstrap_complete()) {
+            auto [upgrade_lock_holder, upgrade_state] = co_await _group0->client().get_group0_upgrade_state();
+            co_return upgrade_state == group0_upgrade_state::use_post_raft_procedures ? &_group0->group0_server() : nullptr;
+        } else {
+            slogger.info("raft topology: wait for cluster upgrade before bootstrapping");
+            // We cannot bootstrap a node into a cluster that is not upgraded yet
+            co_await _group0->client().wait_until_group0_upgraded(_abort_source);
+            slogger.info("raft topology: upgrade completed. Proceed with bootstrapping");
+            co_return &_group0->group0_server();
+        }
+    } ();
+
     auto schema_change_announce = _db.local().observable_schema_version().observe([this] (table_schema_version schema_version) mutable {
         _migration_manager.local().passive_announce(std::move(schema_version));
     });
@@ -537,6 +1019,49 @@ future<> storage_service::join_token_ring(cdc::generation_service& cdc_gen_servi
     co_await _gossiper.wait_for_gossip_to_settle();
 
     set_mode(mode::JOINING);
+
+    if (raft_server) { // Raft is enabled. Check if we need to bootstrap ourself using raft
+        slogger.info("topology changes are using raft");
+
+        // start topology coordinator fiber
+        _raft_state_monitor = raft_state_monitor_fiber(*raft_server, sys_dist_ks);
+
+        // Need to start system_distributed_keyspace before bootstrap because bootstraping
+        // process may access those tables.
+        supervisor::notify("starting system distributed keyspace");
+        co_await sys_dist_ks.invoke_on_all(&db::system_distributed_keyspace::start);
+
+        if (is_replacing()) {
+            assert(raft_replace_info);
+            co_await raft_replace(*raft_server, raft_replace_info->raft_id, raft_replace_info->ip_addr);
+        } else {
+            co_await raft_bootstrap(*raft_server);
+        }
+
+        // Wait until we enter one of the final states
+        co_await _topology_state_machine.event.when([this, raft_server] {
+            return _topology_state_machine._topology.normal_nodes.contains(raft_server->id()) ||
+            _topology_state_machine._topology.left_nodes.contains(raft_server->id());
+        });
+
+        if (_topology_state_machine._topology.left_nodes.contains(raft_server->id())) {
+            throw std::runtime_error("A node that already left the cluster cannot be restarted");
+        }
+
+        // Node state is enough to know that bootstrap has completed, but to make legacy code happy
+        // let it know that the bootstrap is completed as well
+        co_await _sys_ks.local().set_bootstrap_state(db::system_keyspace::bootstrap_state::COMPLETED);
+        set_mode(mode::NORMAL);
+
+        if (get_token_metadata().sorted_tokens().empty()) {
+            auto err = format("join_token_ring: Sorted token in token_metadata is empty");
+            slogger.error("{}", err);
+            throw std::runtime_error(err);
+        }
+
+        co_await _group0->finish_setup_after_join();
+        co_return;
+    }
 
     // We bootstrap if we haven't successfully bootstrapped before, as long as we are not a seed.
     // If we are a seed, or if the user manually sets auto_bootstrap to false,
@@ -913,6 +1438,12 @@ future<> storage_service::handle_state_bootstrap(inet_address endpoint) {
 
 future<> storage_service::handle_state_normal(inet_address endpoint) {
     slogger.debug("endpoint={} handle_state_normal", endpoint);
+
+    if (_raft_topology_change_enabled) {
+        slogger.debug("ignore handle_state_normal since topology change are using raft");
+        co_return;
+    }
+
     auto tokens = get_tokens_for(endpoint);
 
     slogger.debug("Node {} state normal, token {}", endpoint, tokens);
@@ -1110,6 +1641,12 @@ future<> storage_service::handle_state_leaving(inet_address endpoint) {
 }
 
 future<> storage_service::handle_state_left(inet_address endpoint, std::vector<sstring> pieces) {
+
+    if (_raft_topology_change_enabled) {
+        slogger.debug("ignore handle_state_left since topology change are using raft");
+        co_return;
+    }
+
     slogger.debug("endpoint={} handle_state_left", endpoint);
     if (pieces.size() < 2) {
         slogger.warn("Fail to handle_state_left endpoint={} pieces={}", endpoint, pieces);
@@ -1468,6 +2005,8 @@ future<> storage_service::join_cluster(cdc::generation_service& cdc_gen_service,
     assert(this_shard_id() == 0);
 
     _group0 = &group0;
+    _raft_topology_change_enabled = _group0->is_raft_enabled() && _db.local().get_config().check_experimental(db::experimental_features_t::feature::RAFT);
+
     return seastar::async([this, &cdc_gen_service, &sys_dist_ks, &proxy] {
         set_mode(mode::STARTING);
 
@@ -1624,8 +2163,9 @@ future<> storage_service::stop() {
     // make sure nobody uses the semaphore
     node_ops_singal_abort(std::nullopt);
     _listeners.clear();
+     _topology_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
     co_await _async_gate.close();
-    co_await std::move(_node_ops_abort_thread);
+    co_await when_all(std::move(_node_ops_abort_thread), std::move(_raft_state_monitor));
 }
 
 future<> storage_service::check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes, const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features) {
@@ -1645,7 +2185,9 @@ future<> storage_service::check_for_endpoint_collision(std::unordered_set<gms::i
                 throw std::runtime_error(fmt::format("A node with address {} already exists, cancelling join. "
                     "Use replace_address if you want to replace this node.", addr));
             }
-            if (_db.local().get_config().consistent_rangemovement()) {
+            if (_db.local().get_config().consistent_rangemovement() &&
+                // Raft is responsible for consistency, so in case it is enable no need to check here
+                !_raft_topology_change_enabled) {
                 found_bootstrapping_node = false;
                 for (auto& x : _gossiper.get_endpoint_states()) {
                     auto state = _gossiper.get_gossip_status(x.second);
@@ -1741,9 +2283,12 @@ storage_service::prepare_replacement_info(std::unordered_set<gms::inet_address> 
         throw std::runtime_error(format("Cannot replace_address {} because it has left the ring, status={}", replace_address, status));
     }
 
-    auto tokens = get_tokens_for(replace_address);
-    if (tokens.empty()) {
-        throw std::runtime_error(format("Could not find tokens for {} to replace", replace_address));
+    std::unordered_set<dht::token> tokens;
+    if (!_raft_topology_change_enabled) {
+        tokens = get_tokens_for(replace_address);
+        if (tokens.empty()) {
+            throw std::runtime_error(format("Could not find tokens for {} to replace", replace_address));
+        }
     }
 
     auto dc_rack = get_dc_rack_for(replace_address);
@@ -2019,10 +2564,61 @@ future<> storage_service::node_ops_cmd_heartbeat_updater(node_ops_cmd cmd, node_
     slogger.info("{}[{}]: Stopped heartbeat_updater", ops, uuid);
 }
 
+future<> storage_service::raft_decomission() {
+    auto& raft_server = _group0->group0_server();
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(&_abort_source);
+
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it) {
+            throw std::runtime_error(fmt::format("local node {} is not a member of the cluster", raft_server.id()));
+        }
+
+        const auto& rs = it->second;
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(fmt::format("local node is not in the normal state (current state: {})", rs.state));
+        }
+
+        if (_topology_state_machine._topology.normal_nodes.size() == 1) {
+            throw std::runtime_error("Cannot decomission last node in the cluster");
+        }
+
+        slogger.info("raft topology: request decomission for: {}", raft_server.id());
+        db::system_keyspace::topology_mutation_builder builder(guard.write_timestamp(), raft_server.id());
+        builder.set("topology_request", topology_request::leave);
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, fmt::format("decomission: request decomission", raft_server.id()));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), &_abort_source);
+        } catch (group0_concurrent_modification&) {
+            slogger.info("raft topology: decomission: concurrent operation is detected, retrying.");
+            continue;
+        }
+        break;
+    }
+
+    // Wait until we enter left state
+    co_await _topology_state_machine.event.when([this, &raft_server] {
+        return _topology_state_machine._topology.left_nodes.contains(raft_server.id());
+    });
+
+    // Need to set it otherwise gossiper will try to send shutdown on exit
+    co_await _gossiper.add_local_application_state({{ gms::application_state::STATUS, gms::versioned_value::left({}, _gossiper.now().time_since_epoch().count()) }});
+}
+
 future<> storage_service::decommission() {
     return run_with_api_lock(sstring("decommission"), [] (storage_service& ss) {
         return seastar::async([&ss] {
+            bool raft_available = false;
+            bool left_token_ring = false;
             auto uuid = node_ops_id::create_random_id();
+            if (ss._raft_topology_change_enabled) {
+                ss.raft_decomission().get();
+                raft_available = true;
+            } else {
             auto tmptr = ss.get_token_metadata_ptr();
             auto& db = ss._db.local();
             auto endpoint = ss.get_broadcast_address();
@@ -2088,8 +2684,7 @@ future<> storage_service::decommission() {
             }
 
             assert(ss._group0);
-            bool raft_available = ss._group0->wait_for_raft().get();
-            bool left_token_ring = false;
+            raft_available = ss._group0->wait_for_raft().get();
 
             // Step 2: Prepare to sync data
             std::unordered_set<gms::inet_address> nodes_unknown_verb;
@@ -2172,6 +2767,7 @@ future<> storage_service::decommission() {
                 slogger.warn("decommission[{}]: Abort decommission operation finished, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
                 throw;
             }
+            }
 
             // Step 8: Leave group 0
             //
@@ -2185,7 +2781,11 @@ future<> storage_service::decommission() {
                 if (raft_available && left_token_ring) {
                     slogger.info("decommission[{}]: leaving Raft group 0", uuid);
                     assert(ss._group0);
-                    ss._group0->leave_group0().get();
+                    try {
+                        ss._group0->leave_group0().get();
+                    } catch (raft::not_a_member& err) {
+                        slogger.info("DECOMMISSIONING: already removed from the raft config by the topology coordinator");
+                    }
                     slogger.info("decommission[{}]: left Raft group 0", uuid);
                 }
             } catch (...) {
@@ -2478,9 +3078,75 @@ void storage_service::run_replace_ops(std::unordered_set<token>& bootstrap_token
     }
 }
 
+future<> storage_service::raft_removenode(locator::host_id host_id) {
+    auto& raft_server = _group0->group0_server();
+
+    auto id = raft::server_id{host_id.uuid()};
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(&_abort_source);
+
+        auto it = _topology_state_machine._topology.find(id);
+
+        if (!it) {
+            throw std::runtime_error(format("raft topology removenode: host id {} is not found in the cluster", host_id));
+        }
+
+        auto& rs = it->second; // not usable after yeild
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(format("raft topology removenode: node {} is in '{}' state. Wait for it to be in 'normal' state", id, rs.state));
+        }
+        const auto& am = _group0->address_map();
+        auto ip = am.find(id);
+        if (!ip) {
+            // What to do if there is no mapping? Wait and retry?
+            on_fatal_internal_error(slogger, format("Remove node cannot find a mapping from node id {} to its ip", id));
+        }
+
+        if (_gossiper.is_alive(*ip)) {
+            const std::string message = format(
+                "raft topology removenode: Rejected removenode operation for node {} ip {} "
+                "the node being removed is alive, maybe you should use decommission instead?",
+                id, *ip);
+            slogger.warn(std::string_view(message));
+            throw std::runtime_error(message);
+        }
+
+        slogger.info("raft topology: request removenode for: {}", id);
+        db::system_keyspace::topology_mutation_builder builder(guard.write_timestamp(), id);
+        builder.set("topology_request", topology_request::remove);
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, fmt::format("removenode: request remove for {}", id));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), &_abort_source);
+        } catch (group0_concurrent_modification&) {
+            slogger.info("raft topology: removenode: concurrent operation is detected, retrying.");
+            continue;
+        }
+
+        break;
+    }
+
+    // Wait the node we are removing to enter left state
+    co_await _topology_state_machine.event.when([this, id] {
+        return _topology_state_machine._topology.left_nodes.contains(id);
+    });
+
+    try {
+        co_await _group0->remove_from_raft_config(id);
+    } catch (raft::not_a_member&) {
+        slogger.info("raft topology removenode: already removed from the raft config by the topology coordinator");
+    }
+}
+
 future<> storage_service::removenode(locator::host_id host_id, std::list<locator::host_id_or_endpoint> ignore_nodes_params) {
     return run_with_api_lock(sstring("removenode"), [host_id, ignore_nodes_params = std::move(ignore_nodes_params)] (storage_service& ss) mutable {
         return seastar::async([&ss, host_id, ignore_nodes_params = std::move(ignore_nodes_params)] () mutable {
+            if (ss._raft_topology_change_enabled) {
+                ss.raft_removenode(host_id).get();
+                return;
+            }
             auto uuid = node_ops_id::create_random_id();
             auto tmptr = ss.get_token_metadata_ptr();
             auto endpoint_opt = tmptr->get_endpoint_for_host_id(host_id);
@@ -3500,7 +4166,147 @@ future<> storage_service::snitch_reconfigured() {
 
 future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(sharded<db::system_distributed_keyspace>& sys_dist_ks, raft::term_t term, const raft_topology_cmd& cmd) {
         raft_topology_cmd_result result;
-        slogger.trace("raft topology: boot cmd rpc {} is called", cmd.cmd);
+        slogger.trace("raft topology: topology cmd rpc {} is called", cmd.cmd);
+
+        // The retrier does:
+        // If no operation was previously started - start it now
+        // If previous operation still running - wait for it an return its result
+        // If previous operation completed sucessfully - return immediately
+        // If previous opertaion failed - restart it
+        auto retrier = [] (std::optional<shared_future<>>& f, auto&& func) -> future<> {
+            if (!f || f->failed()) {
+                if (f) {
+                    slogger.info("raft topology: retry streaming after previous attempt failed with {}", f->get_future().get_exception());
+                } else {
+                    slogger.info("raft topology: start streaming");
+                }
+                f = func();
+            } else {
+                slogger.debug("raft topology: already streaming");
+            }
+            co_await f.value().get_future();
+            slogger.info("raft topology: streaming completed");
+        };
+
+        try {
+            auto& raft_server = _group0->group0_server();
+            // do barrier to make sure we always see the latest topology
+            co_await raft_server.read_barrier(&_abort_source);
+            if (raft_server.get_current_term() != term) {
+               // Return an error since the command is from outdated leader
+               co_return result;
+            }
+            switch (cmd.cmd) {
+                case raft_topology_cmd::command::barrier:
+                    // we already did read barrier above
+                    result.status = raft_topology_cmd_result::command_status::success;
+                break;
+                case raft_topology_cmd::command::stream_ranges: {
+                    const auto& rs = _topology_state_machine._topology.find(raft_server.id())->second;
+                    if (!rs.ring || (rs.ring->state != ring_slice::replication_state::write_both_read_old && rs.state != node_state::normal)) {
+                        slogger.warn("raft topology: got stream_ranges request while my tokens state is {} and node state is {}",
+                                    rs.ring ? fmt::format("{}", rs.ring->state) : "'missing ring'", rs.state);
+                        break;
+                    }
+                    switch(rs.state) {
+                    case node_state::bootstrapping:
+                    case node_state::replacing: {
+                        set_mode(mode::BOOTSTRAP);
+                        // See issue #4001
+                        co_await mark_existing_views_as_built(sys_dist_ks);
+                        co_await _db.invoke_on_all([this] (replica::database& db) {
+                            for (auto& cf : db.get_non_system_column_families()) {
+                                cf->notify_bootstrap_or_replace_start();
+                            }
+                        });
+                        if (rs.state == node_state::bootstrapping) {
+                            if (!_topology_state_machine._topology.normal_nodes.empty()) { // stream only if there is a node in normal state
+                                co_await retrier(_bootstrap_result, coroutine::lambda([&] () -> future<> {
+                                    if (is_repair_based_node_ops_enabled(streaming::stream_reason::bootstrap)) {
+                                        co_await _repair.local().bootstrap_with_repair(get_token_metadata_ptr(), rs.ring.value().tokens);
+                                    } else {
+                                        dht::boot_strapper bs(_db, _stream_manager, _abort_source, get_broadcast_address(),
+                                            locator::endpoint_dc_rack{rs.datacenter, rs.rack}, rs.ring.value().tokens, get_token_metadata_ptr());
+                                        co_await bs.bootstrap(streaming::stream_reason::bootstrap, _gossiper);
+                                    }
+                                }));
+                            }
+                            // Bootstrap did not complete yet, but streaming did
+                        } else {
+                            co_await retrier(_bootstrap_result, coroutine::lambda([&] () ->future<> {
+                                if (is_repair_based_node_ops_enabled(streaming::stream_reason::replace)) {
+                                    co_await _repair.local().replace_with_repair(get_token_metadata_ptr(), rs.ring.value().tokens, {});
+                                } else {
+                                    dht::boot_strapper bs(_db, _stream_manager, _abort_source, get_broadcast_address(),
+                                                          locator::endpoint_dc_rack{rs.datacenter, rs.rack}, rs.ring.value().tokens, get_token_metadata_ptr());
+                                    auto replaced_id = rs.replaced_id.value();
+                                    auto existing_ip = _group0->address_map().find(replaced_id);
+                                    assert(existing_ip);
+                                    co_await bs.bootstrap(streaming::stream_reason::replace, _gossiper, *existing_ip);
+                                }
+                            }));
+                        }
+                        co_await _db.invoke_on_all([this] (replica::database& db) {
+                            for (auto& cf : db.get_non_system_column_families()) {
+                                cf->notify_bootstrap_or_replace_end();
+                            }
+                        });
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    }
+                    break;
+                    case node_state::decommissioning:
+                        co_await retrier(_unbootstrap_result, coroutine::lambda([&] () { return unbootstrap(); }));
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    break;
+                    case node_state::normal: {
+                        // If asked to stream a node in normal state it mneans that remove operation is running
+                        // Find the node that is been removed
+                        auto it = boost::find_if(_topology_state_machine._topology.transition_nodes, [] (auto& e) { return e.second.state == node_state::removing; });
+                        if (it == _topology_state_machine._topology.transition_nodes.end()) {
+                            slogger.warn("raft topology: got stream_ranges request while my state is normal but cannot find a node that is been removed");
+                            break;
+                        }
+                        slogger.debug("raft topology: streaming to remove node {}", it->first);
+                        const auto& am = _group0->address_map();
+                        auto ip = am.find(it->first); // map node id to ip
+                        assert (ip); // what to do if address is unknown?
+                        co_await retrier(_remove_result[it->first], coroutine::lambda([&] () {
+                            auto as = make_shared<abort_source>();
+                            auto sub = _abort_source.subscribe([as] () noexcept {
+                                if (!as->abort_requested()) {
+                                    as->request_abort();
+                                }
+                            });
+                            if (is_repair_based_node_ops_enabled(streaming::stream_reason::removenode)) {
+                                auto ops = seastar::make_shared<node_ops_info>(node_ops_id::create_random_id(), as, std::list<gms::inet_address>());
+                                // FIXME: ignore node list support
+                                return _repair.local().removenode_with_repair(get_token_metadata_ptr(), *ip, ops);
+                            } else {
+                                return removenode_with_stream(*ip, as);
+                            }
+                        }));
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    }
+                    break;
+                    case node_state::left:
+                    case node_state::none:
+                    case node_state::removing:
+                        on_fatal_internal_error(slogger, fmt::format("Node {} got streaming request in state {}. It should be either dead or not part of the cluster",
+                                         raft_server.id(), rs.state));
+                    break;
+                    }
+                }
+                break;
+                case raft_topology_cmd::command::fence_old_reads:
+                    // We need to make sure all reads that used old topology are completed
+                    // The simplest way to do it for now is to sleep for read timeout
+                    //co_await sleep_abortable(_db.local().get_config().read_request_timeout_in_ms() * std::chrono::milliseconds(1), _abort_source);
+                    result.status = raft_topology_cmd_result::command_status::success;
+                break;
+            }
+        } catch (...) {
+            slogger.error("raft topology: raft_topology_cmd failed with: {}", std::current_exception());
+        }
         co_return result;
 }
 
