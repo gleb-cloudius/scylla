@@ -78,7 +78,7 @@ future<prepare_response> paxos_state::prepare(storage_proxy& sp, tracing::trace_
                                     prv, tr_state, timeout);
                         });
                     });
-                    return when_all(std::move(f1), std::move(f2)).then([state = std::move(state), only_digest] (auto t) {
+                    return when_all(std::move(f1), std::move(f2)).then([state = std::move(state), only_digest, schema] (auto t) {
                         if (utils::get_local_injector().enter("paxos_error_after_save_promise")) {
                             return make_exception_future<prepare_response>(utils::injected_error("injected_error_after_save_promise"));
                         }
@@ -103,6 +103,27 @@ future<prepare_response> paxos_state::prepare(storage_proxy& sp, tracing::trace_
                             auto ex = f2.get_exception();
                             logger.debug("Failed to get data or digest: {}. Ignored.", std::move(ex));
                         }
+
+                        if (state._most_recent_commit) {
+                            logger.debug("Promise mrc={}", state._most_recent_commit->update.schema_version());
+                            // In case current schema is not the same as the schema in the most recent commit
+                            // try to look it up first in the local schema_registry cache and upgrade
+                            // the mutation using schema from the cache.
+                            //
+                            // If there's no schema in the cache, then retrieve persisted column mapping
+                            // for that version and upgrade the mutation with it.
+                            if (state._most_recent_commit->update.schema_version() != schema->version()) {
+                                logger.debug("Stored mutation references outdated schema version. "
+                                    "Trying to upgrade the accepted proposal mutation to the most recent schema version.");
+                                return service::get_column_mapping(state._most_recent_commit->update.column_family_id(), state._most_recent_commit->update.schema_version())
+                                    .then([schema, state = std::move(state), data_or_digest = std::move(data_or_digest)] (const column_mapping& cm) mutable {
+                                        proposal p(state._most_recent_commit->ballot, freeze(state._most_recent_commit->update.unfreeze_upgrading(schema, cm)));
+                                        return make_ready_future<prepare_response>(prepare_response(promise(std::move(state._accepted_proposal),
+                                                        std::move(p), std::move(data_or_digest))));
+                                    });
+                            }
+                        }
+
                         return make_ready_future<prepare_response>(prepare_response(promise(std::move(state._accepted_proposal),
                                         std::move(state._most_recent_commit), std::move(data_or_digest))));
                     });
@@ -198,15 +219,9 @@ future<> paxos_state::learn(storage_proxy& sp, schema_ptr schema, proposal decis
                 // If there's no schema in the cache, then retrieve persisted column mapping
                 // for that version and upgrade the mutation with it.
                 if (decision.update.schema_version() != schema->version()) {
-                    logger.debug("Stored mutation references outdated schema version. "
-                        "Trying to upgrade the accepted proposal mutation to the most recent schema version.");
-                    return service::get_column_mapping(decision.update.column_family_id(), decision.update.schema_version())
-                        .then([&sp, schema, tr_state, timeout, &decision] (const column_mapping& cm) {
-                            return do_with(decision.update.unfreeze_upgrading(schema, cm), [&sp, tr_state, timeout] (const mutation& upgraded) {
-                                return sp.mutate_locally(upgraded, tr_state, db::commitlog::force_sync::yes, timeout);
-                            });
-                        });
+                    on_internal_error(logger, format("schema version in learn does not match current schema"));
                 }
+
                 return sp.mutate_locally(schema, decision.update, tr_state, db::commitlog::force_sync::yes, timeout);
             });
         } else {
