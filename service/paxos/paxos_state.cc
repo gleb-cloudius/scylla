@@ -78,16 +78,23 @@ future<prepare_response> paxos_state::prepare(storage_proxy& sp, tracing::trace_
                                     prv, tr_state, timeout);
                         });
                     });
-                    return when_all(std::move(f1), std::move(f2)).then([state = std::move(state), only_digest] (auto t) {
+                    return when_all(std::move(f1), std::move(f2)).then([state_ = std::move(state), only_digest_ = only_digest, schema_ = schema] (auto t) -> future<prepare_response> {
+                        // Copy captured state into the co-routine because the
+                        // capture will not be available after first premption
+                        // point
+                        auto state = std::move(state_);
+                        auto only_digest = only_digest_;
+                        auto schema = std::move(schema_);
+
                         if (utils::get_local_injector().enter("paxos_error_after_save_promise")) {
-                            return make_exception_future<prepare_response>(utils::injected_error("injected_error_after_save_promise"));
+                            co_return coroutine::return_exception(utils::injected_error("injected_error_after_save_promise"));
                         }
                         auto&& f1 = std::get<0>(t);
                         auto&& f2 = std::get<1>(t);
                         if (f1.failed()) {
                             f2.ignore_ready_future();
                             // Failed to save promise. Nothing we can do but throw.
-                            return make_exception_future<prepare_response>(f1.get_exception());
+                            co_return coroutine::exception(f1.get_exception());
                         }
                         std::optional<std::variant<foreign_ptr<lw_shared_ptr<query::result>>, query::result_digest>> data_or_digest;
                         if (!f2.failed()) {
@@ -103,8 +110,22 @@ future<prepare_response> paxos_state::prepare(storage_proxy& sp, tracing::trace_
                             auto ex = f2.get_exception();
                             logger.debug("Failed to get data or digest: {}. Ignored.", std::move(ex));
                         }
-                        return make_ready_future<prepare_response>(prepare_response(promise(std::move(state._accepted_proposal),
-                                        std::move(state._most_recent_commit), std::move(data_or_digest))));
+                        auto upgrade_if_needed = [&schema] (std::optional<proposal> p) -> future<std::optional<proposal>> {
+                            if (!p || p->update.schema_version() == schema->version()) {
+                                co_return std::move(p);
+                            }
+                            // In case current schema is not the same as the schema in the proposal
+                            // try to look it up first in the local schema_registry cache and upgrade
+                            // the mutation using schema from the cache.
+                            //
+                            // If there's no schema in the cache, then retrieve persisted column mapping
+                            // for that version and upgrade the mutation with it.
+                            logger.debug("Stored mutation references outdated schema version. "
+                                "Trying to upgrade the accepted proposal mutation to the most recent schema version.");
+                            const column_mapping& cm = co_await service::get_column_mapping(p->update.column_family_id(), p->update.schema_version());
+                            co_return proposal(p->ballot, freeze(p->update.unfreeze_upgrading(schema, cm)));
+                        };
+                        co_return prepare_response(promise(co_await upgrade_if_needed(std::move(state._accepted_proposal)), co_await upgrade_if_needed(std::move(state._most_recent_commit)), std::move(data_or_digest)));
                     });
                 } else {
                     logger.debug("Promise rejected; {} is not sufficiently newer than {}", ballot, state._promised_ballot);
@@ -198,15 +219,9 @@ future<> paxos_state::learn(storage_proxy& sp, schema_ptr schema, proposal decis
                 // If there's no schema in the cache, then retrieve persisted column mapping
                 // for that version and upgrade the mutation with it.
                 if (decision.update.schema_version() != schema->version()) {
-                    logger.debug("Stored mutation references outdated schema version. "
-                        "Trying to upgrade the accepted proposal mutation to the most recent schema version.");
-                    return service::get_column_mapping(decision.update.column_family_id(), decision.update.schema_version())
-                        .then([&sp, schema, tr_state, timeout, &decision] (const column_mapping& cm) {
-                            return do_with(decision.update.unfreeze_upgrading(schema, cm), [&sp, tr_state, timeout] (const mutation& upgraded) {
-                                return sp.mutate_locally(upgraded, tr_state, db::commitlog::force_sync::yes, timeout);
-                            });
-                        });
+                    on_internal_error(logger, format("schema version in learn does not match current schema"));
                 }
+
                 return sp.mutate_locally(schema, decision.update, tr_state, db::commitlog::force_sync::yes, timeout);
             });
         } else {
