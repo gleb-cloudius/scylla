@@ -187,6 +187,29 @@ async def manager(request, manager_internal):
 def cql(manager):
     yield manager.cql
 
+# While the raft-based topology changes are still experimental and only
+# optionally enabled some tests are expected to pass on Scylla with this
+# option enabled, and fail with it enabled.
+# These tests should use the "fails_with_raft_topology" fixture. When Raft mode
+# becomes the default, this fixture can be removed together with test they guard.
+@pytest.fixture(scope="function")
+def check_pre_raft_topology(manager):
+    # If not running on Scylla, return false.
+    names = [row.table_name for row in manager.cql.execute(
+            "SELECT * FROM system_schema.tables WHERE keyspace_name = 'system'")]
+    if not any('scylla' in name for name in names):
+        return False
+    # In Scylla, we check Raft mode by inspecting the configuration via CQL.
+    experimental_features = list(manager.cql.execute(
+            "SELECT value FROM system.config WHERE name = 'experimental_features'"))[0].value
+    return not '"raft"' in experimental_features
+
+@pytest.fixture(scope="function")
+def fails_with_raft_topology(request, check_pre_raft_topology):
+    if not check_pre_raft_topology:
+        request.node.add_marker(pytest.mark.xfail(reason="Test expected to fail with Raft topology"
+                                                         "experimental feature on"))
+
 # Consistent schema change feature is optionally enabled and
 # some tests are expected to fail on Scylla without this
 # option enabled, and pass with it enabled (and also pass on Cassandra).
