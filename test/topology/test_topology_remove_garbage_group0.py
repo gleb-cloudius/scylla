@@ -17,7 +17,7 @@ import pytest
 logger = logging.getLogger(__name__)
 
 
-async def test_remove_garbage_group0_members(manager: ManagerClient):
+async def test_remove_garbage_group0_members(manager: ManagerClient, fails_with_raft):
     """
     Verify that failing to leave group 0 or remove a node from group 0 in removenode/decommission
     can be handled by executing removenode (which should clear the 'garbage' group 0 member),
