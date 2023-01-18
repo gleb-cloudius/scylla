@@ -241,7 +241,7 @@ async def test_nodes_with_different_smp(manager: ManagerClient, random_tables: R
 
 
 @pytest.mark.asyncio
-async def test_remove_garbage_group0_members(manager: ManagerClient, random_tables):
+async def test_remove_garbage_group0_members(manager: ManagerClient, random_tables, fails_with_raft):
     """
     Verify that failing to leave group 0 or remove a node from group 0 in removenode/decommission
     can be handled by executing removenode (which should clear the 'garbage' group 0 member),
