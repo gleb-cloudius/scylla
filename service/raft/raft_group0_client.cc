@@ -111,9 +111,17 @@ struct group0_guard::impl {
         , _upgrade_lock_holder(std::move(upgrade_lock_holder)), _raft_enabled(raft_enabled)
     {}
 
-    void release_read_apply_mutex() {
-        assert(_read_apply_mutex_holder.count() == 1);
-        _read_apply_mutex_holder.return_units(1);
+    bool release_read_apply_mutex() {
+        if (_read_apply_mutex_holder) {
+            assert(_read_apply_mutex_holder.count() == 1);
+            _read_apply_mutex_holder.return_units(1);
+            return true;
+        }
+        return false;
+    }
+
+    semaphore_units<> get_read_apply_mutex() {
+        return std::move(_read_apply_mutex_holder);
     }
 };
 
@@ -133,6 +141,10 @@ utils::UUID group0_guard::new_group0_state_id() const {
 
 api::timestamp_type group0_guard::write_timestamp() const {
     return utils::UUID_gen::micros_timestamp(_impl->_new_group0_state_id);
+}
+
+semaphore_units<> group0_guard::get_read_apply_mutex() {
+    return _impl->get_read_apply_mutex();
 }
 
 bool group0_guard::with_raft() const {
@@ -162,13 +174,13 @@ future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard g
         ser::serialize(cmd, group0_cmd);
 
         // Release the read_apply mutex so `group0_state_machine::apply` can take it.
-        guard._impl->release_read_apply_mutex();
+        auto wait_for_apply = guard._impl->release_read_apply_mutex();
 
         bool retry;
         do {
             retry = false;
             try {
-                co_await _raft_gr.group0().add_entry(cmd, raft::wait_type::applied, as);
+                co_await _raft_gr.group0().add_entry(cmd, wait_for_apply ? raft::wait_type::applied : raft::wait_type::committed, as);
             } catch (const raft::dropped_entry& e) {
                 logger.warn("add_entry: returned \"{}\". Retrying the command (prev_state_id: {}, new_state_id: {})",
                         e, group0_cmd.prev_state_id, group0_cmd.new_state_id);

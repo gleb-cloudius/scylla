@@ -48,6 +48,14 @@ public:
     // Use this timestamp when creating group 0 mutations.
     api::timestamp_type write_timestamp() const;
 
+    // Return apply semaphore mutex to a caller.
+    // If the function is called the add_entry the guard
+    // will be used with will wait for a command to be committed
+    // as opposite to be applied since the apply semaphore will
+    // not be released. The caller needs to destroy the semaphore for
+    // the command to be eventually applied
+    semaphore_units<> get_read_apply_mutex();
+
     // Are we *actually* using group 0 yet?
     // Until the upgrade procedure finishes, we will perform operations such as schema changes using the old way,
     // but still pass the guard around to synchronize operations with the upgrade procedure.
