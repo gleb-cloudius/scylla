@@ -36,6 +36,7 @@
 #include "timestamp.hh"
 #include "utils/overloaded_functor.hh"
 #include <optional>
+#include "replica/database.hh"
 
 namespace service {
 
@@ -59,6 +60,109 @@ static mutation convert_history_mutation(canonical_mutation m, const data_dictio
 
 future<> group0_state_machine::apply(std::vector<raft::command_cref> command) {
     slogger.trace("apply() is called with {} commands", command.size());
+
+    auto last_group0_state_id = co_await db::system_keyspace::get_last_group0_state_id();
+
+    std::vector<group0_command> cmd_to_merge;
+    std::optional<mutation> merged_history_mutation;
+
+    auto can_merge = [&] (group0_command& cmd) {
+        // broadcast table commands cannot be merged
+        return cmd_to_merge.empty() || (cmd_to_merge[0].change.index() == cmd.change.index() && !holds_alternative<broadcast_table_query>(cmd.change));
+    };
+
+    auto add_to_merge = [&] (group0_command&& cmd) {
+        slogger.trace("add to merging set new_state_id: {}", cmd.new_state_id);
+        auto m = convert_history_mutation(std::move(cmd.history_append), _sp.data_dictionary());
+        last_group0_state_id = cmd.new_state_id;
+        cmd_to_merge.push_back(std::move(cmd));
+        if (merged_history_mutation) {
+            merged_history_mutation->apply(std::move(m));
+        } else {
+            merged_history_mutation = std::move(m);
+        }
+    };
+
+    auto merge_and_apply = [&] () -> future<> {
+        auto& cmd = cmd_to_merge.back(); // use metadata from the last merged command
+        slogger.trace("merge and apply new_state_id: {}", cmd.new_state_id);
+        std::unordered_map<table_id, std::unordered_map<dht::token, mutation>> mutations;
+
+        if (cmd_to_merge.size() > 1) { // skip merging if there is only one command
+            for (auto&& c : cmd_to_merge) {
+                std::vector<canonical_mutation> cms;
+
+                cms = std::visit(make_visitor(
+                    [&] (schema_change& chng) {
+                        return std::move(chng.mutations);
+                    },
+                    [&] (broadcast_table_query& query) {
+                        return std::vector<canonical_mutation>{};
+                    },
+                    [&] (topology_change& chng) {
+                        return std::move(chng.mutations);
+                    }
+                ), c.change);
+
+                for (auto&& cm : cms) {
+                    auto& tbl = _sp.local_db().find_column_family(cm.column_family_id());
+                    auto m = cm.to_mutation(tbl.schema());
+                    auto& tbl_muts = mutations[cm.column_family_id()];
+                    auto it = tbl_muts.find(m.token());
+                    if (it == tbl_muts.end()) {
+                        tbl_muts.emplace(m.token(), std::move(m));
+                    } else {
+                        it->second.apply(std::move(m));
+                    }
+                }
+            };
+        }
+
+        auto get_merged_canonical = [&] {
+            std::vector<canonical_mutation> ms;
+            for (auto&& tables : mutations) {
+                for (auto&& partitions : tables.second) {
+                    ms.push_back(canonical_mutation(partitions.second));
+                }
+            }
+            return ms;
+        };
+
+        auto read_apply_mutex_holder = co_await _client.hold_read_apply_mutex();
+
+        // We assume that `cmd.change` was constructed using group0 state which was observed *after* `cmd.prev_state_id` was obtained.
+        // It is now important that we apply the change *before* we append the group0 state ID to the history table.
+        //
+        // If we crash before appending the state ID, when we reapply the command after restart, the change will be applied because
+        // the state ID was not yet appended so the above check will pass.
+
+        // TODO: reapplication of a command after a crash may require contacting a quorum (we need to learn that the command
+        // is committed from a leader). But we may want to ensure that group 0 state is consistent after restart even without
+        // access to quorum, which means we cannot allow partially applied commands. We need to ensure that either the entire
+        // change is applied and the state ID is updated or none of this happens.
+        // E.g. use a write-ahead-entry which contains all this information and make sure it's replayed during restarts.
+
+        co_await std::visit(make_visitor(
+        [&] (schema_change& chng) {
+            auto muts = cmd_to_merge.size() == 1 ? std::move(chng.mutations) : get_merged_canonical();
+            return _mm.merge_schema_from(netw::messaging_service::msg_addr(std::move(cmd.creator_addr)), std::move(muts));
+        },
+        [&] (broadcast_table_query& query) -> future<> {
+            auto result = co_await service::broadcast_tables::execute_broadcast_table_query(_sp, query.query, cmd.new_state_id);
+            _client.set_query_result(cmd.new_state_id, std::move(result));
+        },
+        [&] (topology_change& chng) {
+            auto muts = cmd_to_merge.size() == 1 ? std::move(chng.mutations) : get_merged_canonical();
+            return _ss.topology_transition(_sp, _cdc_gen_svc, cmd.creator_addr, std::move(muts));
+        }
+        ), cmd.change);
+
+        co_await _sp.mutate_locally({std::move(*merged_history_mutation)}, nullptr);
+        merged_history_mutation.reset();
+        cmd_to_merge.clear();
+    };
+
+
     for (auto&& c : command) {
         auto is = ser::as_input_stream(c);
         auto cmd = ser::deserialize(is, boost::type<group0_command>{});
@@ -67,10 +171,7 @@ future<> group0_state_machine::apply(std::vector<raft::command_cref> command) {
                 cmd.prev_state_id, cmd.new_state_id, cmd.creator_addr, cmd.creator_id);
         slogger.trace("cmd.history_append: {}", cmd.history_append);
 
-        auto read_apply_mutex_holder = co_await _client.hold_read_apply_mutex();
-
         if (cmd.prev_state_id) {
-            auto last_group0_state_id = co_await db::system_keyspace::get_last_group0_state_id();
             if (*cmd.prev_state_id != last_group0_state_id) {
                 // This command used obsolete state. Make it a no-op.
                 // BTW. on restart, all commands after last snapshot descriptor become no-ops even when they originally weren't no-ops.
@@ -86,32 +187,14 @@ future<> group0_state_machine::apply(std::vector<raft::command_cref> command) {
             slogger.trace("unconditional modification, cmd.new_state_id: {}", cmd.new_state_id);
         }
 
-        // We assume that `cmd.change` was constructed using group0 state which was observed *after* `cmd.prev_state_id` was obtained.
-        // It is now important that we apply the change *before* we append the group0 state ID to the history table.
-        //
-        // If we crash before appending the state ID, when we reapply the command after restart, the change will be applied because
-        // the state ID was not yet appended so the above check will pass.
-
-        // TODO: reapplication of a command after a crash may require contacting a quorum (we need to learn that the command
-        // is committed from a leader). But we may want to ensure that group 0 state is consistent after restart even without
-        // access to quorum, which means we cannot allow partially applied commands. We need to ensure that either the entire
-        // change is applied and the state ID is updated or none of this happens.
-        // E.g. use a write-ahead-entry which contains all this information and make sure it's replayed during restarts.
-
-        co_await std::visit(make_visitor(
-        [&] (schema_change& chng) -> future<> {
-            return _mm.merge_schema_from(netw::messaging_service::msg_addr(std::move(cmd.creator_addr)), std::move(chng.mutations));
-        },
-        [&] (broadcast_table_query& query) -> future<> {
-            auto result = co_await service::broadcast_tables::execute_broadcast_table_query(_sp, query.query, cmd.new_state_id);
-            _client.set_query_result(cmd.new_state_id, std::move(result));
-        },
-        [&] (topology_change& chng) -> future<> {
-           return _ss.topology_transition(_sp, _cdc_gen_svc, cmd.creator_addr, std::move(chng.mutations));
+        if (!can_merge(cmd)) {
+            co_await merge_and_apply();
         }
-        ), cmd.change);
+        add_to_merge(std::move(cmd));
+    }
 
-        co_await _sp.mutate_locally({convert_history_mutation(std::move(cmd.history_append), _sp.data_dictionary())}, nullptr);
+    if (!cmd_to_merge.empty()) {
+        co_await merge_and_apply();
     }
 }
 
