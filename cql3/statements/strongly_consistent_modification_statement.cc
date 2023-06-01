@@ -62,10 +62,10 @@ evaluate_prepared(
             : std::nullopt
     };
 }
-    
+
 future<::shared_ptr<cql_transport::messages::result_message>>
 strongly_consistent_modification_statement::execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options) const {
-        if (this_shard_id() != 0) {
+    if (this_shard_id() != 0) {
         co_return ::make_shared<cql_transport::messages::result_message::bounce_to_shard>(0, cql3::computed_function_values{});
     }
 
@@ -73,7 +73,7 @@ strongly_consistent_modification_statement::execute_without_checking_exception_m
         qp.get_group0_client(),
         { evaluate_prepared(_query, options) }
     );
-    
+
     co_return co_await std::visit(make_visitor(
         [] (service::broadcast_tables::query_result_conditional_update& qr) -> future<::shared_ptr<cql_transport::messages::result_message>> {
             auto result_set = std::make_unique<cql3::result_set>(std::vector{
