@@ -452,6 +452,9 @@ private:
      */
     bool has_more_results(cql3::internal_query_state& state) const;
 
+    template<typename F>
+    future<::shared_ptr<cql_transport::messages::result_message>> retry_on_group0_concurrent_modification(::shared_ptr<cql_statement> statement,service::query_state& query_state, F&& fn);
+
     ///
     /// \tparam ResultMsgType type of the returned result message (CQL or Thrift)
     /// \tparam PreparedKeyGenerator a function that generates the prepared statement cache key for given query and

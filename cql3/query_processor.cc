@@ -28,6 +28,7 @@
 #include "data_dictionary/data_dictionary.hh"
 #include "utils/hashers.hh"
 #include "utils/error_injection.hh"
+#include "service/migration_manager.hh"
 
 namespace cql3 {
 
@@ -462,6 +463,29 @@ future<> query_processor::stop() {
     });
 }
 
+template<typename F>
+future<::shared_ptr<result_message>>
+query_processor::retry_on_group0_concurrent_modification(::shared_ptr<cql_statement> statement, service::query_state& query_state, F&& fn) {
+    auto retries = _mm.get_concurrent_ddl_retries();
+    while (true) {
+        try {
+            query_state.statement_guard = co_await statement->take_guard(*this);
+            auto res = co_await fn();
+            // Reset guard in case it was not consumed
+            query_state.statement_guard.reset();
+            co_return std::move(res);
+        } catch (const service::group0_concurrent_modification&) {
+            log.warn("Failed to execute DDL statement \"{}\" due to concurrent group 0 modification.{}.",
+                    statement->raw_cql_statement, retries ? " Retrying" : " Number of retries exceeded, giving up");
+            if (retries--) {
+                continue;
+            }
+            throw;
+        }
+    }
+
+}
+
 future<::shared_ptr<result_message>>
 query_processor::execute_direct_without_checking_exception_message(const sstring_view& query_string, service::query_state& query_state, query_options& options) {
     log.trace("execute_direct: \"{}\"", query_string);
@@ -482,13 +506,17 @@ query_processor::execute_direct_without_checking_exception_message(const sstring
         if (!queryState.getClientState().isInternal)
             metrics.regularStatementsExecuted.inc();
 #endif
+
     tracing::trace(query_state.get_trace_state(), "Processing a statement");
-    co_await cql_statement->check_access(*this, query_state.get_client_state());
-    auto m = co_await process_authorized_statement(std::move(cql_statement), query_state, options);
-    for (const auto& w : warnings) {
-        m->add_warning(w);
-    }
-    co_return std::move(m);
+    co_return co_await retry_on_group0_concurrent_modification(cql_statement, query_state,
+        coroutine::lambda([this, cql_statement, &query_state, &options, warnings = std::move(warnings)] () -> future<::shared_ptr<result_message>> {
+            co_await cql_statement->check_access(*this, query_state.get_client_state());
+            auto m = co_await process_authorized_statement(cql_statement, query_state, options);
+            for (const auto& w : warnings) {
+                m->add_warning(w);
+            }
+            co_return std::move(m);
+    }));
 }
 
 future<::shared_ptr<result_message>>
@@ -500,17 +528,18 @@ query_processor::execute_prepared_without_checking_exception_message(
         bool needs_authorization) {
 
     ::shared_ptr<cql_statement> statement = prepared->statement;
-
-    if (needs_authorization) {
-        co_await statement->check_access(*this, query_state.get_client_state());
-        try {
-            co_await _authorized_prepared_cache.insert(*query_state.get_client_state().user(), std::move(cache_key), std::move(prepared));
-        } catch (...) {
-            log.error("failed to cache the entry: {}", std::current_exception());
-        }
-    }
-
-    co_return co_await process_authorized_statement(std::move(statement), query_state, options);
+    co_return co_await retry_on_group0_concurrent_modification(statement, query_state,
+        coroutine::lambda([this, needs_authorization, statement, &query_state, cache_key = std::move(cache_key), prepared = std::move(prepared), &options] () mutable -> future<::shared_ptr<result_message>> {
+            if (needs_authorization) {
+                co_await statement->check_access(*this, query_state.get_client_state());
+                try {
+                    co_await _authorized_prepared_cache.insert(*query_state.get_client_state().user(), std::move(cache_key), std::move(prepared));
+                } catch (...) {
+                    log.error("failed to cache the entry: {}", std::current_exception());
+                }
+            }
+            co_return co_await process_authorized_statement(std::move(statement), query_state, options);
+        }));
 }
 
 future<::shared_ptr<result_message>>
@@ -788,9 +817,14 @@ query_processor::execute_with_params(
         db::consistency_level cl,
         service::query_state& query_state,
         const std::initializer_list<data_value>& values) {
+                auto retries = _mm.get_concurrent_ddl_retries();
     auto opts = make_internal_options(p, values, cl);
-    p->statement->validate(*this, service::client_state::for_internal_calls());
-    auto msg = co_await p->statement->execute(*this, query_state, opts);
+    auto statement = p->statement;
+    auto msg = co_await retry_on_group0_concurrent_modification(statement, query_state,
+        coroutine::lambda([this, statement, &query_state, &opts] () -> future<::shared_ptr<result_message>> {
+            statement->validate(*this, service::client_state::for_internal_calls());
+            co_return co_await statement->execute(*this, query_state, opts);
+        }));
     co_return ::make_shared<untyped_result_set>(msg);
 }
 
@@ -800,6 +834,9 @@ query_processor::execute_batch_without_checking_exception_message(
         service::query_state& query_state,
         query_options& options,
         std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries) {
+    // We do not call batch->take_guard() here and do not have a retry look since
+    // currently it is only needed for schema statements and schema statement cannot
+    // be part of a batch
     co_await batch->check_access(*this, query_state.get_client_state());
     co_await coroutine::parallel_for_each(pending_authorization_entries, [this, &query_state] (auto& e) -> future<> {
             try {

@@ -18,6 +18,8 @@
 
 #include <seastar/core/shared_ptr.hh>
 
+#include "service/raft/raft_group0_client.hh"
+
 class mutation;
 
 namespace cql3 {
@@ -34,6 +36,11 @@ namespace messages = cql_transport::messages;
 class schema_altering_statement : public raw::cf_statement, public cql_statement_no_metadata {
 private:
     const bool _is_column_family_level;
+
+    struct guard : public statement_guard {
+        service::group0_guard group0_guard;
+        guard(service::group0_guard&& g) : group0_guard(std::move(g)) {}
+    };
 
     future<::shared_ptr<messages::result_message>>
     execute0(query_processor& qp, service::query_state& state, const query_options& options) const;
@@ -60,6 +67,7 @@ protected:
 
     virtual future<::shared_ptr<messages::result_message>>
     execute(query_processor& qp, service::query_state& state, const query_options& options) const override;
+    virtual future<std::unique_ptr<statement_guard>> take_guard(query_processor& qp) const override;
 };
 
 }

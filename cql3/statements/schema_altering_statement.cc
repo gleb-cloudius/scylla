@@ -59,9 +59,17 @@ void schema_altering_statement::prepare_keyspace(const service::client_state& st
     }
 }
 
+future<std::unique_ptr<statement_guard>> schema_altering_statement::take_guard(query_processor& qp) const {
+    if (this_shard_id() == 0) {
+        co_return std::make_unique<guard>(co_await qp.get_migration_manager().start_group0_operation());
+    } else {
+        // The command will be bounced to shard zero
+        co_return nullptr;
+    }
+}
+
 future<::shared_ptr<messages::result_message>>
 schema_altering_statement::execute0(query_processor& qp, service::query_state& state, const query_options& options) const {
-    auto& mm = qp.get_migration_manager();
     ::shared_ptr<cql_transport::event::schema_change> ce;
 
     if (this_shard_id() != 0) {
@@ -70,29 +78,18 @@ schema_altering_statement::execute0(query_processor& qp, service::query_state& s
                     std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()));
     }
 
-    auto retries = mm.get_concurrent_ddl_retries();
-    while (true) {
-        try {
-            auto group0_guard = co_await mm.start_group0_operation();
+    assert(state.statement_guard);
+    auto group0_guard = std::move(dynamic_cast<guard&>(*state.statement_guard).group0_guard);
+    state.statement_guard.reset();
 
-            auto [ret, m] = co_await prepare_schema_mutations(qp, group0_guard.write_timestamp());
+    auto [ret, m] = co_await prepare_schema_mutations(qp, group0_guard.write_timestamp());
 
-            if (!m.empty()) {
-                auto description = format("CQL DDL statement: \"{}\"", raw_cql_statement);
-                co_await mm.announce(std::move(m), std::move(group0_guard), description);
-            }
-
-            ce = std::move(ret);
-        } catch (const service::group0_concurrent_modification&) {
-            mylogger.warn("Failed to execute DDL statement \"{}\" due to concurrent group 0 modification.{}.",
-                    raw_cql_statement, retries ? " Retrying" : " Number of retries exceeded, giving up");
-            if (retries--) {
-                continue;
-            }
-            throw;
-        }
-        break;
+    if (!m.empty()) {
+        auto description = format("CQL DDL statement: \"{}\"", raw_cql_statement);
+        co_await qp.get_migration_manager().announce(std::move(m), std::move(group0_guard), description);
     }
+
+    ce = std::move(ret);
 
     // If an IF [NOT] EXISTS clause was used, this may not result in an actual schema change.  To avoid doing
     // extra work in the drivers to handle schema changes, we return an empty message in this case. (CASSANDRA-7600)
