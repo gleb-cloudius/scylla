@@ -27,6 +27,7 @@ schema_altering_statement::schema_altering_statement(timeout_config_selector tim
     , cql_statement_no_metadata(timeout_selector)
     , _is_column_family_level{false}
 {
+  needs_guard = true;
 }
 
 schema_altering_statement::schema_altering_statement(cf_name name, timeout_config_selector timeout_selector)
@@ -34,6 +35,7 @@ schema_altering_statement::schema_altering_statement(cf_name name, timeout_confi
     , cql_statement_no_metadata(timeout_selector)
     , _is_column_family_level{true}
 {
+  needs_guard = true;
 }
 
 future<> schema_altering_statement::grant_permissions_to_creator(const service::client_state&) const {
@@ -55,6 +57,10 @@ void schema_altering_statement::prepare_keyspace(const service::client_state& st
     if (_is_column_family_level) {
         cf_statement::prepare_keyspace(state);
     }
+}
+
+future<std::unique_ptr<statement_guard>> schema_altering_statement::take_guard(query_processor& qp) const {
+    return qp.take_alter_schema_guard();
 }
 
 future<::shared_ptr<messages::result_message>>
@@ -83,6 +89,8 @@ schema_altering_statement::execute(query_processor& qp, service::query_state& st
     });
 }
 
+schema_altering_statement::guard::guard(service::group0_guard&& g,service::migration_manager& mm_, gate::holder&& h)
+            : statement_guard(mm_.get_concurrent_ddl_retries()), group0_guard(std::move(g)), mm(mm_), mm_holder(std::move(h)) {}
 }
 
 }

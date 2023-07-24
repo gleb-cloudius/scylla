@@ -29,6 +29,7 @@
 #include "data_dictionary/data_dictionary.hh"
 #include "utils/hashers.hh"
 #include "utils/error_injection.hh"
+#include "service/migration_manager.hh"
 
 namespace cql3 {
 
@@ -484,16 +485,54 @@ future<> query_processor::stop() {
     });
 }
 
+future<::shared_ptr<cql_transport::messages::result_message>> query_processor::execute_with_guard(
+        std::function<future<::shared_ptr<cql_transport::messages::result_message>>(service::query_state&, ::shared_ptr<cql_statement>, const query_options&)> fn,
+        ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options) {
+    size_t retries = 0;
+    while (true)  {
+        size_t max_retries;
+        try {
+            query_state.statement_guard = co_await statement->take_guard(*this);
+            max_retries = query_state.statement_guard ? query_state.statement_guard->retry_count : 0;
+            auto cleanup = defer([&query_state] {query_state.statement_guard.reset(); }); // Reset guard in case it was not consumed
+            co_return co_await fn(query_state, statement, options);
+        } catch (const retry_statement_execution_error& ex) {
+            bool retry = ++retries <= max_retries;
+            log.warn("Failed to execute statement \"{}\" due to guard conflict.{}.",
+                    statement->raw_cql_statement, retry ? " Retrying" : " Number of retries exceeded, giving up");
+            if (retry) {
+                continue;
+            }
+            std::rethrow_if_nested(ex);
+            throw;
+        }
+    }
+
+}
+
+template<typename... Args>
+future<::shared_ptr<result_message>>
+query_processor::execute_maybe_with_guard(service::query_state& query_state, ::shared_ptr<cql_statement> statement, const query_options& options,
+    future<::shared_ptr<result_message>>(query_processor::*fn)(service::query_state& query_state, ::shared_ptr<cql_statement> statement, const query_options& options, Args...), Args... args) {
+    if (!statement->needs_guard) {
+        return (this->*fn)(query_state, std::move(statement), options, std::forward<Args>(args)...);
+    }
+    static auto exec = [fn] (query_processor& qp, Args... args, service::query_state& query_state, ::shared_ptr<cql_statement> statement, const query_options& options) {
+        return (qp.*fn)(query_state, std::move(statement), options, std::forward<Args>(args)...);
+    };
+    return execute_with_guard(std::bind_front(exec, std::ref(*this), std::forward<Args>(args)...), std::move(statement), query_state, options);
+}
+
 future<::shared_ptr<result_message>>
 query_processor::execute_direct_without_checking_exception_message(const sstring_view& query_string, service::query_state& query_state, query_options& options) {
     log.trace("execute_direct: \"{}\"", query_string);
     tracing::trace(query_state.get_trace_state(), "Parsing a statement");
     auto p = get_statement(query_string, query_state.get_client_state());
-    auto cql_statement = p->statement;
+    auto statement = p->statement;
     const auto warnings = std::move(p->warnings);
-    if (cql_statement->get_bound_terms() != options.get_values_count()) {
+    if (statement->get_bound_terms() != options.get_values_count()) {
         const auto msg = format("Invalid amount of bind variables: expected {:d} received {:d}",
-                cql_statement->get_bound_terms(),
+                statement->get_bound_terms(),
                 options.get_values_count());
         throw exceptions::invalid_request_exception(msg);
     }
@@ -505,8 +544,17 @@ query_processor::execute_direct_without_checking_exception_message(const sstring
             metrics.regularStatementsExecuted.inc();
 #endif
     tracing::trace(query_state.get_trace_state(), "Processing a statement");
-    co_await cql_statement->check_access(*this, query_state.get_client_state());
-    auto m = co_await process_authorized_statement(std::move(cql_statement), query_state, options);
+    return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_direct, std::move(warnings));
+}
+
+future<::shared_ptr<result_message>>
+query_processor::do_execute_direct(
+         service::query_state& query_state,
+        shared_ptr<cql_statement> statement,
+        const query_options& options,
+        cql3::cql_warnings_vec warnings) {
+    co_await statement->check_access(*this, query_state.get_client_state());
+    auto m = co_await process_authorized_statement(statement, query_state, options);
     for (const auto& w : warnings) {
         m->add_warning(w);
     }
@@ -521,6 +569,17 @@ query_processor::execute_prepared_without_checking_exception_message(
         statements::prepared_statement::checked_weak_ptr prepared,
         cql3::prepared_cache_key_type cache_key,
         bool needs_authorization) {
+    return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_prepared, std::move(prepared), std::move(cache_key), needs_authorization);
+}
+
+future<::shared_ptr<result_message>>
+query_processor::do_execute_prepared(
+        service::query_state& query_state,
+        shared_ptr<cql_statement> statement,
+        const query_options& options,
+        statements::prepared_statement::checked_weak_ptr prepared,
+        cql3::prepared_cache_key_type cache_key,
+        bool needs_authorization) {
     if (needs_authorization) {
         co_await statement->check_access(*this, query_state.get_client_state());
         try {
@@ -529,7 +588,6 @@ query_processor::execute_prepared_without_checking_exception_message(
             log.error("failed to cache the entry: {}", std::current_exception());
         }
     }
-
     co_return co_await process_authorized_statement(std::move(statement), query_state, options);
 }
 
@@ -821,10 +879,21 @@ query_processor::execute_with_params(
         service::query_state& query_state,
         const std::initializer_list<data_value>& values) {
     auto opts = make_internal_options(p, values, cl);
-    p->statement->validate(*this, service::client_state::for_internal_calls());
-    auto msg = co_await p->statement->execute(*this, query_state, opts);
+    auto statement = p->statement;
+
+    auto msg = co_await execute_maybe_with_guard(query_state, std::move(statement), opts, &query_processor::do_execute_with_params);
     co_return ::make_shared<untyped_result_set>(msg);
 }
+
+future<::shared_ptr<result_message>>
+query_processor::do_execute_with_params(
+        service::query_state& query_state,
+        shared_ptr<cql_statement> statement,
+        const query_options& options) {
+    statement->validate(*this, service::client_state::for_internal_calls());
+    co_return co_await statement->execute(*this, query_state, options);
+}
+
 
 future<::shared_ptr<cql_transport::messages::result_message>>
 query_processor::execute_batch_without_checking_exception_message(
@@ -832,6 +901,9 @@ query_processor::execute_batch_without_checking_exception_message(
         service::query_state& query_state,
         query_options& options,
         std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries) {
+    // We do not call batch->take_guard() here and do not have a retry loop since
+    // currently it is only needed for schema statements and schema statement cannot
+    // be part of a batch
     co_await batch->check_access(*this, query_state.get_client_state());
     co_await coroutine::parallel_for_each(pending_authorization_entries, [this, &query_state] (auto& e) -> future<> {
             try {
@@ -865,6 +937,16 @@ query_processor::forward(query::forward_request req, tracing::trace_state_ptr tr
     co_return co_await remote_.get().forwarder.dispatch(std::move(req), std::move(tr_state));
 }
 
+future<std::unique_ptr<statement_guard>> query_processor::take_alter_schema_guard() {
+    auto [remote_, holder] = remote();
+    if (this_shard_id() == 0) {
+        co_return std::make_unique<schema_altering_statement::guard>(co_await remote_.get().mm.start_group0_operation(), remote_.get().mm, std::move(holder));
+    } else {
+        // The command will be bounced to shard zero
+        co_return nullptr;
+    }
+}
+
 future<::shared_ptr<messages::result_message>>
 query_processor::execute_schema_statement(const statements::schema_altering_statement& stmt, service::query_state& state, const query_options& options) {
     ::shared_ptr<cql_transport::event::schema_change> ce;
@@ -877,32 +959,26 @@ query_processor::execute_schema_statement(const statements::schema_altering_stat
 
     cql3::cql_warnings_vec warnings;
 
-    auto [remote_, holder] = remote();
-    auto& mm = remote_.get().mm;
-    auto retries = mm.get_concurrent_ddl_retries();
-    while (true) {
-        try {
-            auto group0_guard = co_await mm.start_group0_operation();
-
-            auto [ret, m, cql_warnings] = co_await stmt.prepare_schema_mutations(*this, group0_guard.write_timestamp());
-            warnings = std::move(cql_warnings);
-
-            if (!m.empty()) {
-                auto description = format("CQL DDL statement: \"{}\"", stmt.raw_cql_statement);
-                co_await mm.announce(std::move(m), std::move(group0_guard), description);
-            }
-
-            ce = std::move(ret);
-        } catch (const service::group0_concurrent_modification&) {
-            log.warn("Failed to execute DDL statement \"{}\" due to concurrent group 0 modification.{}.",
-                    stmt.raw_cql_statement, retries ? " Retrying" : " Number of retries exceeded, giving up");
-            if (retries--) {
-                continue;
-            }
-            throw;
-        }
-        break;
+    if (!state.statement_guard) {
+        on_internal_error(log, "Guard must be present when executing DDL");
     }
+    std::unique_ptr<statement_guard> guard_ptr = std::exchange(state.statement_guard, nullptr);
+    auto& guard = dynamic_cast<schema_altering_statement::guard&>(*guard_ptr);
+    auto group0_guard = std::move(guard.group0_guard);
+
+    auto [ret, m, cql_warnings] = co_await stmt.prepare_schema_mutations(*this, group0_guard.write_timestamp());
+    warnings = std::move(cql_warnings);
+
+    if (!m.empty()) {
+        auto description = format("CQL DDL statement: \"{}\"", stmt.raw_cql_statement);
+        try {
+            co_await guard.mm.announce(std::move(m), std::move(group0_guard), description);
+        } catch (const service::group0_concurrent_modification&) {
+            std::throw_with_nested(retry_statement_execution_error{});
+        }
+    }
+
+    ce = std::move(ret);
 
     // If an IF [NOT] EXISTS clause was used, this may not result in an actual schema change.  To avoid doing
     // extra work in the drivers to handle schema changes, we return an empty message in this case. (CASSANDRA-7600)
