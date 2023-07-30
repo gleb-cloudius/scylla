@@ -515,14 +515,12 @@ query_processor::execute_direct_without_checking_exception_message(const sstring
 
 future<::shared_ptr<result_message>>
 query_processor::execute_prepared_without_checking_exception_message(
+        service::query_state& query_state,
+        shared_ptr<cql_statement> statement,
+        const query_options& options,
         statements::prepared_statement::checked_weak_ptr prepared,
         cql3::prepared_cache_key_type cache_key,
-        service::query_state& query_state,
-        const query_options& options,
         bool needs_authorization) {
-
-    ::shared_ptr<cql_statement> statement = prepared->statement;
-
     if (needs_authorization) {
         co_await statement->check_access(*this, query_state.get_client_state());
         try {

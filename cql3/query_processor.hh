@@ -205,11 +205,13 @@ public:
             service::query_state& query_state,
             const query_options& options,
             bool needs_authorization) {
+        auto cql_statement = statement->statement;
         return execute_prepared_without_checking_exception_message(
+                query_state,
+                std::move(cql_statement),
+                options,
                 std::move(statement),
                 std::move(cache_key),
-                query_state,
-                options,
                 needs_authorization)
                 .then(cql_transport::messages::propagate_exception_as_future<::shared_ptr<cql_transport::messages::result_message>>);
     }
@@ -218,10 +220,11 @@ public:
     // The result_message::exception must be explicitly handled.
     future<::shared_ptr<cql_transport::messages::result_message>>
     execute_prepared_without_checking_exception_message(
-            statements::prepared_statement::checked_weak_ptr statement,
-            cql3::prepared_cache_key_type cache_key,
             service::query_state& query_state,
+            shared_ptr<cql_statement> statement,
             const query_options& options,
+            statements::prepared_statement::checked_weak_ptr prepared,
+            cql3::prepared_cache_key_type cache_key,
             bool needs_authorization);
 
     /// Execute a client statement that was not prepared.
