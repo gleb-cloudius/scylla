@@ -27,8 +27,6 @@ private:
     service_permit _permit;
 
 public:
-    std::unique_ptr<cql3::statement_guard> statement_guard;
-
     query_state(client_state& client_state, service_permit permit)
             : _client_state(client_state)
             , _trace_state_ptr(tracing::trace_state_ptr())
