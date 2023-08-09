@@ -27,7 +27,7 @@ public:
     future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor&
                     , service::query_state&
                     , const query_options&
-                    , service::group0_guard* guard) const override;
+                    , std::optional<service::group0_guard> guard) const override;
 };
 
 }

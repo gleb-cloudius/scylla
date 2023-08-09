@@ -60,7 +60,7 @@ void schema_altering_statement::prepare_keyspace(const service::client_state& st
 }
 
 future<::shared_ptr<messages::result_message>>
-schema_altering_statement::execute(query_processor& qp, service::query_state& state, const query_options& options, service::group0_guard* guard) const {
+schema_altering_statement::execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
     bool internal = state.get_client_state().is_internal();
     if (internal) {
         auto replication_type = locator::replication_strategy_type::everywhere_topology;
@@ -75,7 +75,7 @@ schema_altering_statement::execute(query_processor& qp, service::query_state& st
         }
     }
 
-    return qp.execute_schema_statement(*this, state, options, guard).then([this, &state, internal](::shared_ptr<messages::result_message> result) {
+    return qp.execute_schema_statement(*this, state, options, std::move(guard)).then([this, &state, internal](::shared_ptr<messages::result_message> result) {
         auto permissions_granted_fut = internal
                 ? make_ready_future<>()
                 : grant_permissions_to_creator(state.get_client_state());

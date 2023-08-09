@@ -11,13 +11,13 @@
 #pragma once
 
 #include "timeout_config.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace service {
 
 class storage_proxy;
 class query_state;
 class client_state;
-class group0_guard;
 
 }
 
@@ -86,7 +86,7 @@ public:
      * @param options options for this query (consistency, variables, pageSize, ...)
      */
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-        execute(query_processor& qp, service::query_state& state, const query_options& options, service::group0_guard* guard) const = 0;
+        execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const = 0;
 
     /**
      * Execute the statement and return the resulting result or null if there is no result.
@@ -98,8 +98,8 @@ public:
      * @param options options for this query (consistency, variables, pageSize, ...)
      */
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-            execute_without_checking_exception_message(query_processor& qp, service::query_state& state, const query_options& options, service::group0_guard* guard) const {
-        return execute(qp, state, options, guard);
+            execute_without_checking_exception_message(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
+        return execute(qp, state, options, std::move(guard));
     }
 
     virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const = 0;

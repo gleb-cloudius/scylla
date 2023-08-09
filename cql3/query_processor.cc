@@ -486,7 +486,7 @@ future<> query_processor::stop() {
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>> query_processor::execute_with_guard(
-        std::function<future<::shared_ptr<cql_transport::messages::result_message>>(service::query_state&, ::shared_ptr<cql_statement>, const query_options&, service::group0_guard*)> fn,
+        std::function<future<::shared_ptr<cql_transport::messages::result_message>>(service::query_state&, ::shared_ptr<cql_statement>, const query_options&, std::optional<service::group0_guard>)> fn,
         ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options) {
     // execute all statements that need group0 guard on shard0
     if (this_shard_id() != 0) {
@@ -499,7 +499,7 @@ future<::shared_ptr<cql_transport::messages::result_message>> query_processor::e
     while (true)  {
         try {
             auto guard = co_await remote_.get().mm.start_group0_operation();
-            co_return co_await fn(query_state, statement, options, &guard);
+            co_return co_await fn(query_state, statement, options, std::move(guard));
         } catch (const service::group0_concurrent_modification& ex) {
             retries--;
             log.warn("Failed to execute statement \"{}\" due to guard conflict.{}.",
@@ -515,12 +515,12 @@ future<::shared_ptr<cql_transport::messages::result_message>> query_processor::e
 template<typename... Args>
 future<::shared_ptr<result_message>>
 query_processor::execute_maybe_with_guard(service::query_state& query_state, ::shared_ptr<cql_statement> statement, const query_options& options,
-    future<::shared_ptr<result_message>>(query_processor::*fn)(service::query_state&, ::shared_ptr<cql_statement>, const query_options&, service::group0_guard*, Args...), Args... args) {
+    future<::shared_ptr<result_message>>(query_processor::*fn)(service::query_state&, ::shared_ptr<cql_statement>, const query_options&, std::optional<service::group0_guard>, Args...), Args... args) {
     if (!statement->needs_guard) {
-        return (this->*fn)(query_state, std::move(statement), options, nullptr, std::forward<Args>(args)...);
+        return (this->*fn)(query_state, std::move(statement), options, std::nullopt, std::forward<Args>(args)...);
     }
-    static auto exec = [fn] (query_processor& qp, Args... args, service::query_state& query_state, ::shared_ptr<cql_statement> statement, const query_options& options, service::group0_guard* guard) {
-        return (qp.*fn)(query_state, std::move(statement), options, guard, std::forward<Args>(args)...);
+    static auto exec = [fn] (query_processor& qp, Args... args, service::query_state& query_state, ::shared_ptr<cql_statement> statement, const query_options& options, std::optional<service::group0_guard> guard) {
+        return (qp.*fn)(query_state, std::move(statement), options, std::move(guard), std::forward<Args>(args)...);
     };
     return execute_with_guard(std::bind_front(exec, std::ref(*this), std::forward<Args>(args)...), std::move(statement), query_state, options);
 }
@@ -554,10 +554,10 @@ query_processor::do_execute_direct(
          service::query_state& query_state,
         shared_ptr<cql_statement> statement,
         const query_options& options,
-        service::group0_guard* guard,
+        std::optional<service::group0_guard> guard,
         cql3::cql_warnings_vec warnings) {
     co_await statement->check_access(*this, query_state.get_client_state());
-    auto m = co_await process_authorized_statement(statement, query_state, options, guard);
+    auto m = co_await process_authorized_statement(statement, query_state, options, std::move(guard));
     for (const auto& w : warnings) {
         m->add_warning(w);
     }
@@ -580,7 +580,7 @@ query_processor::do_execute_prepared(
         service::query_state& query_state,
         shared_ptr<cql_statement> statement,
         const query_options& options,
-        service::group0_guard* guard,
+        std::optional<service::group0_guard> guard,
         statements::prepared_statement::checked_weak_ptr prepared,
         cql3::prepared_cache_key_type cache_key,
         bool needs_authorization) {
@@ -592,18 +592,18 @@ query_processor::do_execute_prepared(
             log.error("failed to cache the entry: {}", std::current_exception());
         }
     }
-    co_return co_await process_authorized_statement(std::move(statement), query_state, options, guard);
+    co_return co_await process_authorized_statement(std::move(statement), query_state, options, std::move(guard));
 }
 
 future<::shared_ptr<result_message>>
-query_processor::process_authorized_statement(const ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options, service::group0_guard* guard) {
+query_processor::process_authorized_statement(const ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options, std::optional<service::group0_guard> guard) {
     auto& client_state = query_state.get_client_state();
 
     ++_stats.queries_by_cl[size_t(options.get_consistency())];
 
     statement->validate(*this, client_state);
 
-    auto msg = co_await statement->execute_without_checking_exception_message(*this, query_state, options, guard);
+    auto msg = co_await statement->execute_without_checking_exception_message(*this, query_state, options, std::move(guard));
 
     if (msg) {
        co_return std::move(msg);
@@ -809,7 +809,7 @@ query_processor::execute_paged_internal(internal_query_state& state) {
     state.p->statement->validate(*this, service::client_state::for_internal_calls());
     auto qs = query_state_for_internal_call();
     ::shared_ptr<cql_transport::messages::result_message> msg =
-      co_await state.p->statement->execute(*this, qs, *state.opts, nullptr);
+      co_await state.p->statement->execute(*this, qs, *state.opts, std::nullopt);
 
     class visitor : public result_message::visitor_base {
         internal_query_state& _state;
@@ -893,9 +893,9 @@ future<::shared_ptr<result_message>>
 query_processor::do_execute_with_params(
         service::query_state& query_state,
         shared_ptr<cql_statement> statement,
-        const query_options& options, service::group0_guard* guard) {
+        const query_options& options, std::optional<service::group0_guard> guard) {
     statement->validate(*this, service::client_state::for_internal_calls());
-    co_return co_await statement->execute(*this, query_state, options, guard);
+    co_return co_await statement->execute(*this, query_state, options, std::move(guard));
 }
 
 
@@ -923,7 +923,7 @@ query_processor::execute_batch_without_checking_exception_message(
         }
         log.trace("execute_batch({}): {}", batch->get_statements().size(), oss.str());
     }
-    co_return co_await batch->execute(*this, query_state, options, nullptr);
+    co_return co_await batch->execute(*this, query_state, options, std::nullopt);
 }
 
 future<service::broadcast_tables::query_result>
@@ -939,7 +939,7 @@ query_processor::forward(query::forward_request req, tracing::trace_state_ptr tr
 }
 
 future<::shared_ptr<messages::result_message>>
-query_processor::execute_schema_statement(const statements::schema_altering_statement& stmt, service::query_state& state, const query_options& options, service::group0_guard* guard) {
+query_processor::execute_schema_statement(const statements::schema_altering_statement& stmt, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) {
     ::shared_ptr<cql_transport::event::schema_change> ce;
 
     if (this_shard_id() != 0) {

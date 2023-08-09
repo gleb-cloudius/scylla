@@ -36,7 +36,7 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 attach_service_level_statement::execute(query_processor& qp,
         service::query_state &state,
         const query_options &,
-        service::group0_guard* guard) const {
+        std::optional<service::group0_guard> guard) const {
     return state.get_service_level_controller().get_distributed_service_level(_service_level).then([this] (qos::service_levels_info sli) {
         if (sli.empty()) {
             throw qos::nonexistant_service_level_exception(_service_level);

@@ -35,7 +35,7 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 detach_service_level_statement::execute(query_processor& qp,
         service::query_state &state,
         const query_options &,
-        service::group0_guard* guard) const {
+        std::optional<service::group0_guard> guard) const {
     return state.get_client_state().get_auth_service()->underlying_role_manager().remove_attribute(_role_name, "service_level").then([] {
         using void_result_msg = cql_transport::messages::result_message::void_message;
         using result_msg = cql_transport::messages::result_message;
