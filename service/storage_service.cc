@@ -2457,7 +2457,7 @@ future<> topology_coordinator::rollback_current_topology_op(group0_guard&& guard
         co_await global_token_metadata_barrier(co_await start_operation(), std::move(exclude_nodes));
     } catch (term_changed_error&) {
     } catch(...) {
-        slogger.warn("raft topology: failed to run metadata barrier during rollback", std::current_exception());
+        slogger.warn("raft topology: failed to run metadata barrier during rollback {}", std::current_exception());
     }
 }
 
@@ -4532,7 +4532,7 @@ future<> storage_service::raft_decomission() {
             throw std::runtime_error("Cannot decomission last node in the cluster");
         }
 
-        slogger.info("raft topology: request decomission for: {}", raft_server.id());
+        slogger.info("raft topology: request decommission for: {}", raft_server.id());
         topology_mutation_builder builder(guard.write_timestamp());
         builder.with_node(raft_server.id())
                .set("topology_request", topology_request::leave);
