@@ -788,8 +788,7 @@ private:
     std::optional<shared_future<>> _rebuild_result;
     std::unordered_map<raft::server_id, std::optional<shared_future<>>> _remove_result;
     tablet_op_registry _tablet_ops;
-    // During decommission, the node waits for the coordinator to tell it to shut down.
-    std::optional<promise<>> _shutdown_request_promise;
+
     struct {
         raft::term_t term{0};
         uint64_t last_index{0};

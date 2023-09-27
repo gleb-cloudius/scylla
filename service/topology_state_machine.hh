@@ -184,7 +184,6 @@ struct raft_topology_cmd {
           stream_ranges,        // reqeust to stream data, return when streaming is
                                 // done
           fence,                // erect the fence against requests with stale versions
-          shutdown,             // a decommissioning node should shut down
       };
       command cmd;
 
