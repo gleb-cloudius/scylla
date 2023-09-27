@@ -205,9 +205,6 @@ std::ostream& operator<<(std::ostream& os, const raft_topology_cmd::command& cmd
         case raft_topology_cmd::command::fence:
             os << "fence";
             break;
-        case raft_topology_cmd::command::shutdown:
-            os << "shutdown";
-            break;
     }
     return os;
 }

@@ -2229,7 +2229,7 @@ class topology_coordinator {
                 auto node_id = node.id;
                 bool shutdown_failed = false;
                 try {
-                    node = co_await exec_direct_command(std::move(node), raft_topology_cmd::command::shutdown);
+                    node = co_await exec_direct_command(std::move(node), raft_topology_cmd::command::barrier);
                 } catch (...) {
                     slogger.warn("raft topology: failed to tell node {} to shut down - it may hang."
                                  " It's safe to shut it down manually now. (Exception: {})",
@@ -4441,9 +4441,6 @@ future<> storage_service::raft_decomission() {
     auto& raft_server = _group0->group0_server();
 
     auto shutdown_request_future = make_ready_future<>();
-    auto disengage_shutdown_promise = defer([this] {
-        _shutdown_request_promise = std::nullopt;
-    });
 
     while (true) {
         auto guard = co_await _group0->client().start_operation(&_abort_source);
@@ -4463,8 +4460,6 @@ future<> storage_service::raft_decomission() {
             throw std::runtime_error("Cannot decomission last node in the cluster");
         }
 
-        shutdown_request_future = _shutdown_request_promise.emplace().get_future();
-
         slogger.info("raft topology: request decomission for: {}", raft_server.id());
         topology_mutation_builder builder(guard.write_timestamp());
         builder.with_node(raft_server.id())
@@ -4481,8 +4476,14 @@ future<> storage_service::raft_decomission() {
         break;
     }
 
-    // Wait for the coordinator to tell us to shut down.
-    co_await std::move(shutdown_request_future);
+    co_await _topology_state_machine.event.when([this, &raft_server] {
+        // Wait for this node to move to state left or left_token_ring which means that decomission completed
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it || it->second.state == node_state::left_token_ring) {
+            return true; // node either left or on the way
+        }
+        return false;
+    });
 
     // Need to set it otherwise gossiper will try to send shutdown on exit
     co_await _gossiper.add_local_application_state({{ gms::application_state::STATUS, gms::versioned_value::left({}, _gossiper.now().time_since_epoch().count()) }});
@@ -6145,13 +6146,6 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(shar
                 result.status = raft_topology_cmd_result::command_status::success;
                 break;
             }
-            case raft_topology_cmd::command::shutdown:
-                if (_shutdown_request_promise) {
-                    std::exchange(_shutdown_request_promise, std::nullopt)->set_value();
-                } else {
-                    slogger.warn("raft topology: got shutdown request while not decommissioning");
-                }
-                break;
         }
     } catch (...) {
         slogger.error("raft topology: raft_topology_cmd failed with: {}", std::current_exception());
