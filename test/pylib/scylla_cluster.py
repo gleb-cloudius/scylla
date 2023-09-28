@@ -1232,7 +1232,7 @@ class ScyllaClusterManager:
                           server.log_filename)
             return aiohttp.web.Response(status=500,
                                         text=f"Error decommissioning {server}: {exc}")
-        await self.cluster.server_stop(server_id, gracefully=True)
+#        await self.cluster.server_stop(server_id, gracefully=True)
         return aiohttp.web.Response(text="OK")
 
     async def _cluster_rebuild_node(self, request) -> aiohttp.web.Response:

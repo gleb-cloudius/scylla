@@ -4581,7 +4581,11 @@ future<> storage_service::decommission() {
         return seastar::async([&ss] {
             std::exception_ptr leave_group0_ex;
             if (ss._raft_topology_change_enabled) {
-                ss.raft_decomission().get();
+                try {
+                    ss.raft_decomission().get();
+                } catch (...) {
+                    return;
+                }
             } else {
                 bool left_token_ring = false;
                 auto uuid = node_ops_id::create_random_id();
@@ -4940,7 +4944,10 @@ future<> storage_service::removenode(locator::host_id host_id, std::list<locator
     return run_with_api_lock(sstring("removenode"), [host_id, ignore_nodes_params = std::move(ignore_nodes_params)] (storage_service& ss) mutable {
         return seastar::async([&ss, host_id, ignore_nodes_params = std::move(ignore_nodes_params)] () mutable {
             if (ss._raft_topology_change_enabled) {
-                ss.raft_removenode(host_id, std::move(ignore_nodes_params)).get();
+                try {
+                    ss.raft_removenode(host_id, std::move(ignore_nodes_params)).get();
+                } catch (...) {
+                }
                 return;
             }
             node_ops_ctl ctl(ss, node_ops_cmd::removenode_prepare, host_id, gms::inet_address());
