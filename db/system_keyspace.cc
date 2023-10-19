@@ -2536,6 +2536,15 @@ future<service::topology> system_keyspace::load_topology_state() {
                 }
                 ret.req_param.emplace(host_id, service::rebuild_param{*rebuild_option});
                 break;
+            case service::node_state::left_token_ring:
+                // If replacenode fails the node is moved to left_token_ring state where it executes the metadata
+                // barrier. It needs to know what nodes to ignore during the barrier. Not that it will also inore those
+                // nodes during regular decomission (we do not remove replaced_id, and ignored_ids when we move to normal state)
+                // but this is OK since because ignored nodes should be dead
+                if (replaced_id) {
+                    ret.req_param.emplace(host_id, service::replace_param{*replaced_id, std::move(ignored_ids)});
+                }
+                break;
             default:
                 // no parameters for other operations
                 break;
