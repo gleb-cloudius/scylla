@@ -82,6 +82,7 @@ struct replica_state {
     size_t shard_count;
     uint8_t ignore_msb;
     std::set<sstring> supported_features;
+    bool cleanup_needed;
 };
 
 struct topology_features {
