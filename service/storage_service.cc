@@ -2058,11 +2058,15 @@ class topology_coordinator {
                 }
                 switch(node.rs->state) {
                 case node_state::bootstrapping: {
+                    std::vector<canonical_mutation> muts;
+                    // Since after bootstrapping a new node some nodes lost some ranges they need to cleanup
+                    muts = mark_all_nodes_as_cleanup_needed(node.guard.write_timestamp());
                     topology_mutation_builder builder(node.guard.write_timestamp());
                     builder.del_transition_state()
                            .with_node(node.id)
                            .set("node_state", node_state::normal);
-                    co_await update_topology_state(take_guard(std::move(node)), {builder.build()},
+                    muts.emplace_back(builder.build());
+                    co_await update_topology_state(take_guard(std::move(node)), std::move(muts),
                                                    "bootstrap: read fence completed");
                     }
                     break;
@@ -2509,10 +2513,18 @@ future<> topology_coordinator::rollback_current_topology_op(group0_guard&& guard
            .with_node(node.id)
            .set("node_state", state);
 
+    std::vector<canonical_mutation> muts;
+    if (state == node_state::normal) {
+        // if we are back to the normal state it means that we abort remove or decommission
+        // which may have streamed some ranges to other nodes. Cleanup is needed.
+        muts = mark_all_nodes_as_cleanup_needed(node.guard.write_timestamp());
+    }
+    muts.emplace_back(builder.build());
+
     auto str = fmt::format("rollback {} after {} failure to state {}", node.id, node.rs->state, state);
 
     slogger.info("{}", str);
-    co_await update_topology_state(std::move(node.guard), {builder.build()}, str);
+    co_await update_topology_state(std::move(node.guard), std::move(muts), str);
     // Try to run metadata barrier to wait for all double writes to complete
     // but ignore failures.
     while (true) {
