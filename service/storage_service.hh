@@ -818,6 +818,9 @@ private:
     shared_promise<> _join_node_response_done;
     semaphore _join_node_response_handler_mutex{1};
 
+    future<> _sstable_cleanup_fiber = make_ready_future<>();
+    future<> sstable_cleanup_fiber(raft::server& raft, sharded<service::storage_proxy>& proxy) noexcept;
+
     friend class join_node_rpc_handshaker;
 };
 
