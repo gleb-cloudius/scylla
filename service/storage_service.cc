@@ -839,6 +839,112 @@ topology_node_mutation_builder& topology_mutation_builder::with_node(raft::serve
     return *_node_builder;
 }
 
+future<> storage_service::sstable_cleanup_fiber(raft::server& server) noexcept {
+    while (!_abort_source.abort_requested()) {
+        bool err = false;
+        try {
+            co_await _topology_state_machine.event.when([&] {
+                auto me = _topology_state_machine._topology.find(server.id());
+                return me && me->second.cleanup_needed;
+            });
+
+            std::vector<std::pair<std::vector<table_info>, tasks::task_manager::task_ptr>> tasks;
+            {
+                // Create the scope for the guard
+                auto guard = co_await _group0->client().start_operation(&_abort_source);
+                auto me = _topology_state_machine._topology.find(server.id());
+                // Recheck that cleanup is needed after the barrier
+                if (!me || !me->second.cleanup_needed) {
+                    slogger.trace("raft topology: cleanup triggered, but not needed {}", !!me);
+                    co_return;
+                }
+
+                co_await container().invoke_on_all([] (storage_service& ss) -> future<> {
+                    auto topology_version = ss._shared_token_metadata.get()->get_version();
+                    auto fence_version = ss._shared_token_metadata.get_fence_version();
+
+                    if (fence_version < topology_version) {
+                        slogger.debug("raft topology: cleanup detected outdated fence version = {} current metadata version = {}. Fixing.", fence_version, topology_version);
+                        // If we are here it means that the barrier during recovery of the pervious topology operation nay have failed.
+                        // There may be ongoing writes with the wrong topology that should be waited locally before starting cleanup.
+                        // Advance the fence first to not admit any more writes with old version and wait for old writes to complete.
+                        // Note that we can get here just because the fiber was woken up before the barrier RPC arrived, but this is fine,
+                        // the barrier RPC will have less work to do.
+                        co_await ss.update_fence_version(topology_version);
+                        co_await ss._shared_token_metadata.stale_versions_in_use();
+                    }
+                });
+
+                slogger.debug("raft topology: start cleanup on {}", server.id());
+
+                auto keyspaces = _db.local().get_all_keyspaces();
+
+                tasks.reserve(keyspaces.size());
+
+                co_await coroutine::parallel_for_each(keyspaces.begin(), keyspaces.end(), [this, &tasks] (const sstring& ks_name) -> future<> {
+                    auto ks = _db.local().find_keyspace(ks_name);
+                    if (ks.get_replication_strategy().is_per_table()) {
+                        co_return;
+                    }
+                    const auto& cf_meta_data = _db.local().find_keyspace(ks_name).metadata().get()->cf_meta_data();
+                    std::vector<table_info> table_infos;
+                    table_infos.reserve(cf_meta_data.size());
+                    for (const auto& [name, schema] : cf_meta_data) {
+                        table_infos.emplace_back(table_info{name, schema->id()});
+                    }
+
+                    auto& compaction_module = _db.local().get_compaction_manager().get_task_manager_module();
+                    auto task = co_await compaction_module.make_and_start_task<cleanup_keyspace_compaction_task_impl>({}, ks_name, _db, table_infos);
+                    tasks.push_back(std::make_pair(std::move(table_infos), std::move(task)));
+                });
+            }
+
+            // Note that the guard is released while we are waiting for cleanup tasks to complete
+            co_await coroutine::parallel_for_each(tasks.begin(), tasks.end(), [] (std::pair<std::vector<table_info>, tasks::task_manager::task_ptr> task_info) -> future<> {
+                auto [table_infos, task] = std::move(task_info);
+                try {
+                    co_await task->done();
+                } catch (...) {
+                    slogger.error("force_keyspace_cleanup: keyspace={} tables={} failed: {}", task->get_status().keyspace, table_infos, std::current_exception());
+                    throw;
+                }
+            });
+
+            slogger.debug("raft topology: cleanup ended on {}", server.id());
+
+            while (true) {
+                auto guard = co_await _group0->client().start_operation(&_abort_source);
+                topology_mutation_builder builder(guard.write_timestamp());
+                builder.with_node(server.id()).set("cleanup_needed", false);
+
+                topology_change change{{builder.build()}};
+                group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("cleanup completed for {}", server.id()));
+
+                try {
+                    co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), &_abort_source);
+                } catch (group0_concurrent_modification&) {
+                    slogger.info("raft topology: cleanup flag clearing: concurrent operation is detected, retrying.");
+                    continue;
+                }
+                break;
+            }
+            slogger.debug("raft topology: cleanup flag cleared on {}", server.id());
+        } catch (const seastar::abort_requested_exception &) {
+             slogger.info("raft topology: cleanup fiber aborted");
+             break;
+        } catch (raft::request_aborted&) {
+             slogger.info("raft topology: cleanup fiber aborted");
+             break;
+        } catch (...) {
+             slogger.error("raft topology: cleanup fiber got an error: {}", std::current_exception());
+             err = true;
+        }
+        if (err) {
+            co_await sleep(std::chrono::milliseconds(10));
+        }
+    }
+}
+
 using raft_topology_cmd_handler_type = noncopyable_function<future<raft_topology_cmd_result>(
         sharded<db::system_distributed_keyspace>&, raft::term_t, uint64_t, const raft_topology_cmd&)>;
 
@@ -3086,6 +3192,8 @@ future<> storage_service::join_token_ring(sharded<db::system_distributed_keyspac
 
         // start topology coordinator fiber
         _raft_state_monitor = raft_state_monitor_fiber(*raft_server, sys_dist_ks);
+        // start cleanup fiber
+        _sstable_cleanup_fiber = sstable_cleanup_fiber(*raft_server);
 
         // Need to start system_distributed_keyspace before bootstrap because bootstraping
         // process may access those tables.
@@ -4160,7 +4268,7 @@ future<> storage_service::stop() {
     _listeners.clear();
      _topology_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
     co_await _async_gate.close();
-    co_await when_all(std::move(_node_ops_abort_thread), std::move(_raft_state_monitor));
+    co_await when_all(std::move(_node_ops_abort_thread), std::move(_raft_state_monitor), std::move(_sstable_cleanup_fiber));
 }
 
 future<> storage_service::check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes, const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features) {
