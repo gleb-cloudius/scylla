@@ -2513,6 +2513,9 @@ future<service::topology> system_keyspace::load_topology_state() {
             case service::topology_request::join:
                 ret.req_param.emplace(host_id, service::join_param{num_tokens});
                 break;
+            case service::topology_request::remove:
+                ret.req_param.emplace(host_id, service::removenode_param{std::move(ignored_ids)});
+                break;
             default:
                 // no parameters for other requests
                 break;
