@@ -1041,10 +1041,12 @@ class topology_coordinator {
         auto& topo = _topo_sm._topology;
         const std::pair<const raft::server_id, replica_state>* e = nullptr;
 
+        bool wait_for_cleanup = true;
         std::optional<topology_request> req;
         if (topo.transition_nodes.size() != 0) {
             // If there is a node that is the middle of topology operation continue with it
             e = &*topo.transition_nodes.begin();
+            wait_for_cleanup = false;
         } else if (topo.new_nodes.size() != 0) {
             // Otherwise check if there is a new node that wants to be joined
             e = &*topo.new_nodes.begin();
@@ -1064,7 +1066,20 @@ class topology_coordinator {
         if (rit != topo.req_param.end()) {
             req_param = rit->second;
         }
-        return node_to_work_on{std::move(guard), &topo, e->first, &e->second, std::move(req), std::move(req_param)};
+
+        node_to_work_on node{std::move(guard), &topo, e->first, &e->second, std::move(req), std::move(req_param)};
+
+        if (wait_for_cleanup) {
+            auto exclude_nodes = get_excluded_nodes(node);
+
+            for (auto& [id, rs] : _topo_sm._topology.normal_nodes) {
+                if (!exclude_nodes.contains(id) && rs.cleanup_needed) {
+                    return std::move(node.guard);
+                }
+            }
+        }
+
+        return node;
     };
 
     node_to_work_on get_node_to_work_on(group0_guard guard) {
