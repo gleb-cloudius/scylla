@@ -1031,10 +1031,12 @@ class topology_coordinator {
         auto& topo = _topo_sm._topology;
         const std::pair<const raft::server_id, replica_state>* e = nullptr;
 
+        bool wait_for_cleanup = true;
         std::optional<topology_request> req;
         if (topo.transition_nodes.size() != 0) {
             // If there is a node that is the middle of topology operation continue with it
             e = &*topo.transition_nodes.begin();
+            wait_for_cleanup = false;
         } else if (topo.new_nodes.size() != 0) {
             // Otherwise check if there is a new node that wants to be joined
             e = &*topo.new_nodes.begin();
@@ -1054,7 +1056,33 @@ class topology_coordinator {
         if (rit != topo.req_param.end()) {
             req_param = rit->second;
         }
-        return node_to_work_on{std::move(guard), &topo, e->first, &e->second, std::move(req), std::move(req_param)};
+
+        node_to_work_on node{std::move(guard), &topo, e->first, &e->second, std::move(req), std::move(req_param)};
+
+        if (wait_for_cleanup) {
+            auto exclude_nodes = get_excluded_nodes(node);
+
+            if (node.request && *node.request == topology_request::remove) {
+                // No need to wait for cleanup on that is been removed. It suppose to be dead
+                exclude_nodes.insert(node.id);
+            }
+
+            auto nodes = _topo_sm._topology.normal_nodes | boost::adaptors::filtered(
+                [&exclude_nodes] (const std::pair<const raft::server_id, replica_state>& n) {
+                    return std::none_of(exclude_nodes.begin(), exclude_nodes.end(),
+                            [&n] (const raft::server_id& m) { return n.first == m; });
+                }) | boost::adaptors::map_values;
+            bool cleanup_needed = std::any_of(nodes.begin(), nodes.end(), [] (const replica_state& rs) { return rs.cleanup_needed; });
+
+            // If any node still did not cleaned up after previous topology
+            // operation we cannot start a new one.
+            if (cleanup_needed) {
+                slogger.debug("raft topology: cannot start working on {} because cleanup is not completed yet", node.id);
+                return std::move(node.guard);
+            }
+        }
+
+        return node;
     };
 
     node_to_work_on get_node_to_work_on(group0_guard guard) {
