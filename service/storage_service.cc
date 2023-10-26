@@ -1044,45 +1044,93 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
         }
     }
 
-    // Returns the guard back if no node to work on is found.
-    std::variant<group0_guard, node_to_work_on> get_node_to_work_on_opt(group0_guard guard) {
+    // Returns node if there are enough live nodes to start the request or guard otherwise
+    // cleanup_needed is set to true if any of the non excluded normal node needs cleanup (valid only in case the varian contains a node)
+    std::variant<group0_guard, node_to_work_on> enough_live_node_to_start_request(group0_guard guard, std::optional<topology_request> req, const std::pair<const raft::server_id, replica_state>* e, bool& cleanup_needed) {
         auto& topo = _topo_sm._topology;
-        const std::pair<const raft::server_id, replica_state>* e = nullptr;
-
-        std::optional<topology_request> req;
-        if (topo.transition_nodes.size() != 0) {
-            // If there is a node that is the middle of topology operation continue with it
-            e = &*topo.transition_nodes.begin();
-        } else if (topo.new_nodes.size() != 0) {
-            // Otherwise check if there is a new node that wants to be joined
-            e = &*topo.new_nodes.begin();
-            req = topo.requests[e->first];
-        } else if (!topo.requests.empty()) {
-            // If there is no new node but request queue is not empty there is a request for normal node
-            req = topo.requests.begin()->second;
-            e = &*topo.normal_nodes.find(topo.requests.begin()->first);
-        }
-
-        if (!e) {
-            return guard;
-        }
 
         std::optional<request_param> req_param;
         auto rit = topo.req_param.find(e->first);
         if (rit != topo.req_param.end()) {
             req_param = rit->second;
         }
-        return node_to_work_on{std::move(guard), &topo, e->first, &e->second, std::move(req), std::move(req_param)};
+
+        node_to_work_on node{std::move(guard), &topo, e->first, &e->second, std::move(req), std::move(req_param)};
+
+        auto exclude_nodes = get_excluded_nodes(node);
+
+        cleanup_needed = false;
+        for (auto& [id, rs] : _topo_sm._topology.normal_nodes) {
+            if (exclude_nodes.contains(id)) {
+                continue;
+            }
+
+            if (!_gossiper.is_alive(id2ip(locator::host_id(id.uuid())))) {
+                return std::move(node.guard);
+            } else {
+                cleanup_needed |= rs.cleanup_needed;
+            }
+        }
+
+        return node;
+    }
+
+    struct no_work {
+        group0_guard guard;
+        bool cancel_request_queue = false;
+    };
+
+    // Returns the no_work back if no node to work on is found.
+    std::variant<no_work, node_to_work_on> get_node_to_work_on_opt(group0_guard guard) {
+        auto& topo = _topo_sm._topology;
+
+        if (topo.transition_nodes.size() != 0) {
+            // If there is a node that is the middle of topology operation continue with it
+            return get_node_to_work_on(std::move(guard));
+        }
+
+        node_to_work_on* node = nullptr;
+        std::variant<group0_guard, node_to_work_on> nog(std::move(guard));
+        bool cleanup_needed;
+        for (auto& [id, req] : topo.requests) {
+            nog = enough_live_node_to_start_request(std::move(std::get<group0_guard>(nog)), req, topo.find(id), cleanup_needed);
+
+            if ((node = std::get_if<node_to_work_on>(&nog))) {
+                break;
+            }
+        }
+
+        if (!node) {
+            // We did not find request that has enough live node to proceed
+            // Cancel all requests (if any) to let admin know
+            return no_work{std::move(std::get<group0_guard>(nog)), !topo.requests.empty()};
+        }
+
+        if (cleanup_needed) {
+            // One of the nodes still did not finish the cleanup, so we cannot
+            // start working new topology operation.
+            return no_work{std::move(node->guard), false};
+        }
+
+        return std::move(*node);
     };
 
     node_to_work_on get_node_to_work_on(group0_guard guard) {
-        auto node_or_guard = get_node_to_work_on_opt(std::move(guard));
-        if (auto* node = std::get_if<node_to_work_on>(&node_or_guard)) {
-            return std::move(*node);
+        auto& topo = _topo_sm._topology;
+
+        if (topo.transition_nodes.empty()) {
+            on_internal_error(slogger, ::format(
+                "raft topology: could not find node to work on"
+                " even though the state requires it (state: {})", topo.tstate));
         }
-        on_internal_error(slogger, ::format(
-            "raft topology: could not find node to work on"
-            " even though the state requires it (state: {})", _topo_sm._topology.tstate));
+
+        auto e = &*topo.transition_nodes.begin();
+        std::optional<request_param> req_param;
+        auto rit = topo.req_param.find(e->first);
+        if (rit != topo.req_param.end()) {
+            req_param = rit->second;
+        }
+        return node_to_work_on{std::move(guard), &topo, e->first, &e->second, std::nullopt, std::move(req_param)};
      };
 
     future<group0_guard> start_operation() {
@@ -1904,7 +1952,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
             return std::make_pair(true, std::move(node->guard));
         }
 
-        guard = std::get<group0_guard>(std::move(node_or_guard));
+        auto nw = std::get<no_work>(std::move(node_or_guard));
+        guard = std::move(nw.guard);
+        if (nw.cancel_request_queue) {
+            // request queue needs to be canceled, so preempt balancing
+            return std::make_pair(true, std::move(guard));
+        }
         if (_topo_sm._topology.global_request) {
             return std::make_pair(true, std::move(guard));
         }
@@ -1914,6 +1967,58 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
         }
 
         return std::make_pair(false, std::move(guard));
+    }
+
+    future<> cancel_all_requests(group0_guard guard) {
+        std::vector<canonical_mutation> muts;
+        std::vector<raft::server_id> reject;
+        if (_topo_sm._topology.requests.empty()) {
+            co_return;
+        }
+        auto ts = guard.write_timestamp();
+        for (auto& [id, req] : _topo_sm._topology.requests) {
+            switch (req) {
+                case topology_request::replace:
+                [[fallthrough]];
+                case topology_request::join: {
+                    topology_mutation_builder builder(ts);
+                    builder.with_node(id)
+                           .set("node_state", node_state::left)
+                           .del("topology_request");
+                    reject.emplace_back(id);
+                    muts.emplace_back(builder.build());
+                }
+                break;
+                case topology_request::leave:
+                [[fallthrough]];
+                case topology_request::rebuild:
+                [[fallthrough]];
+                case topology_request::remove: {
+                    topology_mutation_builder builder(ts);
+                    builder.with_node(id)
+                           .del("topology_request");
+                    muts.emplace_back(builder.build());
+                }
+                break;
+            }
+        }
+
+        co_await update_topology_state(std::move(guard), std::move(muts), "cancel all topology requests");
+
+        for (auto id : reject) {
+            try {
+                co_await respond_to_joining_node(id, join_node_response_params{
+                    .response = join_node_response_params::rejected{
+                        .reason = "request canceled because some required nodes are dead"
+                    },
+                });
+            } catch (...) {
+                slogger.warn("raft topology: attempt to send rejection response to {} failed: {}. "
+                                "The node may hang. It's safe to shut it down manually now.",
+                                id, std::current_exception());
+            }
+        }
+
     }
 
     // Returns `true` iff there was work to do.
@@ -1928,7 +2033,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                 co_return true;
             }
 
-            guard = std::get<group0_guard>(std::move(node_or_guard));
+            auto nw = std::get<no_work>(std::move(node_or_guard));
+            guard = std::move(nw.guard);
+            if (nw.cancel_request_queue) {
+                co_await cancel_all_requests(std::move(guard));
+                co_return true;
+            }
             if (_topo_sm._topology.global_request) {
                 co_await handle_global_request(std::move(guard));
                 co_return true;
