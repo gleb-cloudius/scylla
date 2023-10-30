@@ -2523,6 +2523,30 @@ class topology_coordinator {
         );
     }
 
+    std::vector<canonical_mutation> mark_nodes_as_cleanup_needed(node_to_work_on& node, bool rollback) {
+        auto& topo = _topo_sm._topology;
+        std::vector<canonical_mutation> muts;
+        muts.reserve(topo.normal_nodes.size());
+        std::unordered_set<inet_address> dirty_nodes;
+
+        for (auto& [_, erm] : _db.get_non_local_strategy_keyspaces_erms()) {
+            const std::unordered_set<inet_address>& nodes = rollback ? erm->get_all_pending_nodes() : erm->get_dirty_endpoints();
+            dirty_nodes.insert(nodes.begin(), nodes.end());
+        }
+
+        for (auto& ip : dirty_nodes) {
+            auto id = _address_map.find_by_addr(ip).value();
+            // mark all nodes (except self) as cleanup needed
+            if (node.id != id) {
+                topology_mutation_builder builder(node.guard.write_timestamp());
+                builder.with_node(id).set("cleanup_status", cleanup_status::running);
+                muts.emplace_back(builder.build());
+                slogger.trace("raft topology: mark node {} as needed cleanup", id);
+            }
+        }
+        return muts;
+    }
+
     // Returns true if the state machine was transitioned into tablet migration path.
     future<bool> maybe_start_tablet_migration(group0_guard);
 
