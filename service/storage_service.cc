@@ -1026,6 +1026,14 @@ class topology_coordinator {
         }
     }
 
+    auto get_normal_nodes_filtered(const std::unordered_set<raft::server_id>& exclude_nodes) {
+        return _topo_sm._topology.normal_nodes | boost::adaptors::filtered(
+                [&exclude_nodes] (const std::pair<const raft::server_id, replica_state>& n) {
+                    return std::none_of(exclude_nodes.begin(), exclude_nodes.end(),
+                            [&n] (const raft::server_id& m) { return n.first == m; });
+                });
+    }
+
     // Returns the guard back if no node to work on is found.
     std::variant<group0_guard, node_to_work_on> get_node_to_work_on_opt(group0_guard guard) {
         auto& topo = _topo_sm._topology;
@@ -1067,11 +1075,7 @@ class topology_coordinator {
                 exclude_nodes.insert(node.id);
             }
 
-            auto nodes = _topo_sm._topology.normal_nodes | boost::adaptors::filtered(
-                [&exclude_nodes] (const std::pair<const raft::server_id, replica_state>& n) {
-                    return std::none_of(exclude_nodes.begin(), exclude_nodes.end(),
-                            [&n] (const raft::server_id& m) { return n.first == m; });
-                }) | boost::adaptors::map_values;
+            auto nodes = get_normal_nodes_filtered(exclude_nodes) | boost::adaptors::map_values;
             bool cleanup_needed = std::any_of(nodes.begin(), nodes.end(), [] (const replica_state& rs) { return rs.cleanup_needed; });
 
             // If any node still did not cleaned up after previous topology
@@ -1224,11 +1228,7 @@ class topology_coordinator {
             group0_guard guard, const raft_topology_cmd& cmd,
             const std::unordered_set<raft::server_id>& exclude_nodes,
             drop_guard_and_retake drop_and_retake = drop_guard_and_retake::yes) {
-        auto nodes = _topo_sm._topology.normal_nodes | boost::adaptors::filtered(
-                [&exclude_nodes] (const std::pair<const raft::server_id, replica_state>& n) {
-                    return std::none_of(exclude_nodes.begin(), exclude_nodes.end(),
-                            [&n] (const raft::server_id& m) { return n.first == m; });
-                }) | boost::adaptors::map_keys;
+        auto nodes = get_normal_nodes_filtered(exclude_nodes) | boost::adaptors::map_keys;
         if (drop_and_retake) {
             release_guard(std::move(guard));
         }
