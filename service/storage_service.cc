@@ -517,6 +517,8 @@ future<> storage_service::topology_state_load() {
         }
     }));
 
+    co_await update_fence_version(_topology_state_machine._topology.fence_version);
+
     // We don't load gossiper endpoint states in storage_service::join_cluster
     // if _raft_topology_change_enabled. On the other hand gossiper is still needed
     // even in case of _raft_topology_change_enabled mode, since it still contains part
@@ -636,6 +638,7 @@ public:
     topology_mutation_builder(api::timestamp_type ts);
     topology_mutation_builder& set_transition_state(topology::transition_state);
     topology_mutation_builder& set_version(topology::version_t);
+    topology_mutation_builder& set_fence_version(topology::version_t);
     topology_mutation_builder& set_current_cdc_generation_id(const cdc::generation_id_v2&);
     topology_mutation_builder& set_new_cdc_generation_data_uuid(const utils::UUID& value);
     topology_mutation_builder& set_unpublished_cdc_generations(const std::vector<cdc::generation_id_v2>& values);
@@ -788,6 +791,11 @@ topology_mutation_builder& topology_mutation_builder::set_transition_state(topol
 
 topology_mutation_builder& topology_mutation_builder::set_version(topology::version_t value) {
     _m.set_static_cell("version", value, _ts);
+    return *this;
+}
+
+topology_mutation_builder& topology_mutation_builder::set_fence_version(topology::version_t value) {
+    _m.set_static_cell("fence_version", value, _ts);
     return *this;
 }
 
@@ -1471,8 +1479,17 @@ class topology_coordinator {
         if (drain_failed) {
             guard = co_await start_operation();
         }
-        guard = co_await exec_global_command(std::move(guard), raft_topology_cmd::command::fence, exclude_nodes, drop_guard_and_retake::yes);
-        co_return std::move(guard);
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.set_fence_version(_topo_sm._topology.version);
+        auto reason = ::format("advance fence version to {}", _topo_sm._topology.version);
+        co_await update_topology_state(std::move(guard), {builder.build()}, reason);
+        guard = co_await start_operation();
+        if (drain_failed) {
+            // if drain failed need to wait for fence to be active on all nodes
+            co_return co_await exec_global_command(std::move(guard), raft_topology_cmd::command::barrier, exclude_nodes, drop_guard_and_retake::yes);
+        } else {
+            co_return std::move(guard);
+        }
     }
 
     future<group0_guard> global_tablet_token_metadata_barrier(group0_guard guard) {
@@ -2479,12 +2496,17 @@ future<> topology_coordinator::rollback_current_topology_op(group0_guard&& guard
     slogger.info("{}", str);
     co_await update_topology_state(std::move(node.guard), {builder.build()}, str);
     // Try to run metadata barrier to wait for all double writes to complete
-    // but ignore failures
-    try {
-        co_await global_token_metadata_barrier(co_await start_operation(), std::move(exclude_nodes));
-    } catch (term_changed_error&) {
-    } catch(...) {
-        slogger.warn("raft topology: failed to run metadata barrier during rollback {}", std::current_exception());
+    // but ignore failures.
+    while (true) {
+        try {
+            co_await global_token_metadata_barrier(co_await start_operation(), std::move(exclude_nodes));
+        } catch (term_changed_error&) {
+        } catch (group0_concurrent_modification&) {
+            continue;
+        } catch(...) {
+            slogger.warn("raft topology: failed to run metadata barrier during rollback {}", std::current_exception());
+        }
+        break;
     }
 }
 
@@ -6257,17 +6279,6 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(shar
                 }
             }
             break;
-            case raft_topology_cmd::command::fence: {
-                // We can have several concurrent fence commands in case topology change
-                // coordinator migrated to another node. The update_fence_version function
-                // checks that the version doesn't decrease, we do the check and persist
-                // the new version under the same lock to avoid raises.
-                auto holder = co_await get_units(_raft_topology_cmd_handler_state._operation_mutex, 1);
-                co_await update_fence_version(version);
-                co_await _sys_ks.local().update_topology_fence_version(version);
-                result.status = raft_topology_cmd_result::command_status::success;
-                break;
-            }
             case raft_topology_cmd::command::shutdown:
                 if (_shutdown_request_promise) {
                     std::exchange(_shutdown_request_promise, std::nullopt)->set_value();
