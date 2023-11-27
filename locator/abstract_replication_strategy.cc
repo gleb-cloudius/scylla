@@ -376,6 +376,8 @@ future<mutable_vnode_effective_replication_map_ptr> calculate_effective_replicat
     replication_map replication_map;
     ring_mapping pending_endpoints;
     ring_mapping read_endpoints;
+    host_id_set dirty_endpoints;
+
     const auto depend_on_token = rs->natural_endpoints_depend_on_token();
     const auto& sorted_tokens = tmptr->sorted_tokens();
     replication_map.reserve(depend_on_token ? sorted_tokens.size() : 1);
@@ -422,6 +424,12 @@ future<mutable_vnode_effective_replication_map_ptr> calculate_effective_replicat
                 }
             }
 
+            // If an endpoint is in target endpoints, but not in current endpoints it means
+            // it loses a range and becomes dirty
+            std::copy_if(current_endpoints.begin(), current_endpoints.end(), std::back_inserter(dirty_endpoints), [&] (host_id e) {
+                return !target_endpoints.contains(e);
+            });
+
             // in order not to waste memory, we update read_endpoints only if the
             // new endpoints differs from the old one
             if (topology_changes->read_new && target_endpoints.get_vector() != current_endpoints.get_vector()) {
@@ -446,8 +454,9 @@ future<mutable_vnode_effective_replication_map_ptr> calculate_effective_replicat
     }
 
     auto rf = rs->get_replication_factor(*tmptr);
+    auto dead_endpoints_set = resolve_endpoints(dirty_endpoints, *tmptr).extract_set();
     co_return make_effective_replication_map(std::move(rs), std::move(tmptr), std::move(replication_map),
-        std::move(pending_endpoints), std::move(read_endpoints), rf);
+        std::move(pending_endpoints), std::move(read_endpoints), std::move(dead_endpoints_set), rf);
 }
 
 auto vnode_effective_replication_map::clone_data_gently() const -> future<std::unique_ptr<cloned_data>> {
@@ -467,6 +476,10 @@ auto vnode_effective_replication_map::clone_data_gently() const -> future<std::u
         result->read_endpoints += i;
         co_await coroutine::maybe_yield();
     }
+
+    // no need to yield while copying since this is bound by nodes, not vnodes
+    result->dirty_endpoints =  _dirty_endpoints;
+
     co_return std::move(result);
 }
 
@@ -542,7 +555,7 @@ future<vnode_effective_replication_map_ptr> effective_replication_map_factory::c
         auto rf = ref_erm->get_replication_factor();
         auto local_data = co_await ref_erm->clone_data_gently();
         new_erm = make_effective_replication_map(std::move(rs), std::move(tmptr), std::move(local_data->replication_map),
-            std::move(local_data->pending_endpoints), std::move(local_data->read_endpoints), rf);
+            std::move(local_data->pending_endpoints), std::move(local_data->read_endpoints), std::move(local_data->dirty_endpoints), rf);
     } else {
         new_erm = co_await calculate_effective_replication_map(std::move(rs), std::move(tmptr));
     }
