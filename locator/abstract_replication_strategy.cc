@@ -152,6 +152,15 @@ bool vnode_effective_replication_map::has_pending_ranges(inet_address endpoint) 
     return false;
 }
 
+std::unordered_set<inet_address> vnode_effective_replication_map::get_all_pending_nodes() const {
+    std::unordered_set<inet_address> endpoints;
+    for (const auto& item : _pending_endpoints) {
+        endpoints.insert(item.second.begin(), item.second.end());
+    }
+
+    return endpoints;
+}
+
 std::unique_ptr<token_range_splitter> vnode_effective_replication_map::make_splitter() const {
     return locator::make_splitter(_tmptr);
 }
