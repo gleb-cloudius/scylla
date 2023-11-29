@@ -5185,6 +5185,7 @@ future<> storage_service::raft_decommission() {
         return false;
     });
 
+    slogger.info("raft topology: decommission: wait for completion");
     auto res = co_await when_all(std::move(f1), std::move(f2));
 
     if (!std::get<0>(res).failed()) {
@@ -5526,6 +5527,7 @@ future<> storage_service::raft_removenode(locator::host_id host_id, std::list<lo
         break;
     }
 
+    slogger.info("raft topology: removenode: wait for completion");
     bool left = false;
     co_await _topology_state_machine.event.when([this, id, &left] {
         // Wait for this node to move to state left which means that removenode completed
