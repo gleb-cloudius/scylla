@@ -334,6 +334,8 @@ public:
 
     void set_group0(service::raft_group0&, bool raft_topology_change_enabled);
 
+    bool is_topology_coordinator_enabled() const;
+
     future<> drain_on_shutdown();
 
     future<> stop_transport();
@@ -779,6 +781,7 @@ public:
     // Public for `reload_raft_topology_state` REST API.
     future<> topology_transition();
 
+    future<> do_cluster_cleanup();
 public:
     future<> move_tablet(table_id, dht::token, locator::tablet_replica src, locator::tablet_replica dst);
     future<> set_tablet_balancing_enabled(bool);
