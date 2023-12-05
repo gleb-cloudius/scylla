@@ -719,6 +719,16 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         co_return json::json_return_type(0);
     });
 
+    ss::topology_coordinator_run_cleanup.set(r, [&ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        co_await ss.invoke_on(0, [] (service::storage_service& ss) {
+            if (!ss.is_topology_coordinator_enabled()) {
+                throw std::runtime_error("Cannot run cleanup through the topology coordinator because it is disabled");
+            }
+            return ss.do_cluster_cleanup();
+        });
+        co_return json::json_return_type(0);
+    });
+
     ss::perform_keyspace_offstrategy_compaction.set(r, wrap_ks_cf(ctx, [] (http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) -> future<json::json_return_type> {
         apilog.info("perform_keyspace_offstrategy_compaction: keyspace={} tables={}", keyspace, table_infos);
         bool res = false;
@@ -1400,6 +1410,7 @@ void unset_storage_service(http_context& ctx, routes& r) {
     ss::force_compaction.unset(r);
     ss::force_keyspace_compaction.unset(r);
     ss::force_keyspace_cleanup.unset(r);
+    ss::topology_coordinator_run_cleanup.unset(r);
     ss::perform_keyspace_offstrategy_compaction.unset(r);
     ss::upgrade_sstables.unset(r);
     ss::force_flush.unset(r);
