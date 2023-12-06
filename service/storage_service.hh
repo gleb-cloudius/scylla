@@ -331,6 +331,8 @@ public:
 
     void set_group0(service::raft_group0&, bool raft_topology_change_enabled);
 
+    bool is_topology_coordinator_enabled() const;
+
     future<> drain_on_shutdown();
 
     future<> stop_transport();
