@@ -765,6 +765,12 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
     });
 
     ss::force_keyspace_cleanup.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+#ifdef SCYLLA_BUILD_MODE_RELEASE
+        // we want to still alow the API for the testing purposes
+        if (co_await ss.invoke_on(0, [] (service::storage_service& ss) { return ss.is_topology_coordinator_enabled(); })) {
+            throw std::runtime_error("Cleanup of individual keyspaces cannot be used if the topology coordinator is enabled");
+        }
+#endif
         auto& db = ctx.db;
         auto keyspace = validate_keyspace(ctx, req->param);
         auto table_infos = parse_table_infos(keyspace, ctx, req->query_parameters, "cf");
