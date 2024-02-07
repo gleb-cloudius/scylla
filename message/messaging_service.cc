@@ -818,6 +818,26 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         find_and_remove_client(_clients[idx], id, [] (const auto&) { return true; });
     }
 
+    if (!_banned_hosts.empty()) {
+        utils::small_vector<raft::server_id, 2> ids;
+        if (_raft_address_map) {
+            ids = _raft_address_map->find_all_by_addr(id.addr);
+        }
+
+        if (!ids.empty()) {
+            auto banned = true;
+            for (auto rid : ids) {
+                auto hid = locator::host_id(rid.uuid());
+                banned &= is_host_banned(hid);
+            }
+            if (banned) {
+                throw reject_connection(ids, id.addr);
+            }
+        } else {
+                mlogger.warn("cannot translate node ip {} to id during connection establishment (for verb {})", id.addr, int32_t(verb));
+        }
+    }
+
     auto my_host_id = _cfg.id;
     auto broadcast_address = _cfg.broadcast_address;
     bool listen_to_bc = _cfg.listen_on_broadcast_address && _cfg.ip != broadcast_address;

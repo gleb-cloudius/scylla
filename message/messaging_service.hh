@@ -215,6 +215,11 @@ namespace netw {
 
 struct serializer {};
 
+struct reject_connection : public std::runtime_error {
+    reject_connection(utils::small_vector<raft::server_id, 2> ids, gms::inet_address addr) :
+        std::runtime_error::runtime_error(fmt::format("refuse to establish connection to a banned node {}/{}", ids, addr)) {}
+};
+
 struct schema_pull_options {
     bool remote_supports_canonical_mutation_retval = true;
 
