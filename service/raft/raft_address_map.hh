@@ -10,6 +10,7 @@
 #include "gms/inet_address.hh"
 #include "gms/generation-number.hh"
 #include "raft/raft.hh"
+#include "utils/small_vector.hh"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/on_internal_error.hh>
@@ -323,6 +324,29 @@ public:
             entry._lru_entry->touch();
         }
         return it->first;
+    }
+
+    utils::small_vector<raft::server_id, 2> find_all_by_addr(gms::inet_address addr) const {
+        if (addr == gms::inet_address{}) {
+            on_internal_error(rslog, "raft_address_map::find_by_addr: called with an empty address");
+        }
+        auto it = _map.begin();
+        utils::small_vector<raft::server_id, 2> res;
+        while (it != _map.end()) {
+            it = std::find_if(it, _map.end(), [&](auto&& mapping) { return mapping.second._addr == addr; });
+            if (it == _map.end()) {
+                break;
+            }
+
+            auto& entry = it->second;
+            if (entry.expiring()) {
+                entry._lru_entry->touch();
+            }
+
+            res.emplace_back(it->first);
+            it++;
+        }
+        return res;
     }
 
     // Convert an expiring entry to a non-expiring one, or
