@@ -500,6 +500,10 @@ rpc::no_wait_type gossiper::background_msg(sstring type, noncopyable_function<fu
 void gossiper::init_messaging_service_handler() {
     _messaging.register_gossip_digest_syn([this] (const rpc::client_info& cinfo, gossip_digest_syn syn_msg) {
         auto from = netw::messaging_service::get_source(cinfo);
+        auto hid = cinfo.retrieve_auxiliary_opt<locator::host_id>("host_id");
+        if (hid) {
+            _raft_address_map.opt_add_entry(raft::server_id(hid->uuid()), from.addr);
+        }
         return background_msg("GOSSIP_DIGEST_SYN", [from, syn_msg = std::move(syn_msg)] (gms::gossiper& gossiper) mutable {
             return gossiper.handle_syn_msg(from, std::move(syn_msg));
         });
