@@ -45,6 +45,7 @@
 #include "locator/token_metadata.hh"
 #include "utils/exceptions.hh"
 #include "utils/error_injection.hh"
+#include "service/raft/raft_address_map.hh"
 
 namespace gms {
 
@@ -85,13 +86,14 @@ std::chrono::milliseconds gossiper::quarantine_delay() const noexcept {
     return ring_delay * 2;
 }
 
-gossiper::gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg)
+gossiper::gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg, service::raft_address_map& am)
         : _abort_source(as)
         , _shared_token_metadata(stm)
         , _messaging(ms)
         , _failure_detector_timeout_ms(cfg.failure_detector_timeout_in_ms)
         , _force_gossip_generation(cfg.force_gossip_generation)
-        , _gcfg(std::move(gcfg)) {
+        , _gcfg(std::move(gcfg))
+        , _raft_address_map(am) {
     // Gossiper's stuff below runs only on CPU0
     if (this_shard_id() != 0) {
         return;

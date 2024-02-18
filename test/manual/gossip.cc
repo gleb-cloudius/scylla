@@ -21,6 +21,7 @@
 #include <chrono>
 #include "db/config.hh"
 #include "db/schema_tables.hh"
+#include "service/raft/raft_address_map.hh"
 
 namespace bpo = boost::program_options;
 
@@ -73,13 +74,17 @@ int main(int ac, char ** av) {
             messaging.start(locator::host_id{}, listen, 7000).get();
             auto stop_messaging = deferred_stop(messaging);
 
+            sharded<service::raft_address_map> raft_address_map;
+            raft_address_map.start().get();
+            auto stop_am = deferred_stop(raft_address_map);
+
             gms::gossip_config gcfg;
             gcfg.cluster_name = "Test Cluster";
             for (auto s : config["seed"].as<std::vector<std::string>>()) {
                 gcfg.seeds.emplace(std::move(s));
             }
             sharded<gms::gossiper> gossiper;
-            gossiper.start(std::ref(abort_sources), std::ref(token_metadata), std::ref(messaging), std::ref(*cfg), std::move(gcfg)).get();
+            gossiper.start(std::ref(abort_sources), std::ref(token_metadata), std::ref(messaging), std::ref(*cfg), std::move(gcfg), std::ref(raft_address_map)).get();
 
             auto& server = messaging.local();
             auto port = server.port();

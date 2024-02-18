@@ -41,6 +41,11 @@ namespace db {
 class config;
 }
 
+namespace service {
+    template <typename C> class raft_address_map_t;
+    using raft_address_map = raft_address_map_t<seastar::lowres_clock>;
+}
+
 namespace gms {
 
 class gossip_digest_syn;
@@ -276,7 +281,7 @@ private:
     // Must be called under lock_endpoint.
     future<> replicate(inet_address, endpoint_state, permit_id);
 public:
-    explicit gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg);
+    explicit gossiper(abort_source& as, const locator::shared_token_metadata& stm, netw::messaging_service& ms, const db::config& cfg, gossip_config gcfg, service::raft_address_map& am);
 
     /**
      * Register for interesting state changes.
@@ -673,6 +678,8 @@ private:
     utils::updateable_value<uint32_t> _failure_detector_timeout_ms;
     utils::updateable_value<int32_t> _force_gossip_generation;
     gossip_config _gcfg;
+    service::raft_address_map& _raft_address_map;
+
     // Get features supported by a particular node
     std::set<sstring> get_supported_features(inet_address endpoint) const;
     locator::token_metadata_ptr get_token_metadata_ptr() const noexcept;
