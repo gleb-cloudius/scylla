@@ -1267,8 +1267,6 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
             muts.emplace_back(rtbuilder.build());
         }
 
-        co_await update_topology_state(std::move(guard), std::move(muts), "cancel all topology requests");
-
         for (auto id : reject_join) {
             try {
                 co_await respond_to_joining_node(id, join_node_response_params{
@@ -1283,6 +1281,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
             }
         }
 
+        co_await update_topology_state(std::move(guard), std::move(muts), "cancel all topology requests");
     }
 
     // Returns `true` iff there was work to do.
@@ -1865,19 +1864,20 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                         rtbuilder.done("Join is rejected during validation");
                         auto reason = ::format("bootstrap: node rejected");
 
-                        co_await update_topology_state(std::move(node.guard), {builder.build(), rtbuilder.build()}, reason);
-
-                        rtlogger.info("rejected node moved to left state {}", node.id);
-
                         try {
                             co_await respond_to_joining_node(node.id, join_node_response_params{
                                 .response = std::move(validation_result),
                             });
-                        } catch (const std::runtime_error& e) {
+                        } catch (...) {
                             rtlogger.warn("attempt to send rejection response to {} failed. "
                                          "The node may hang. It's safe to shut it down manually now. Error: {}",
-                                         node.id, e.what());
+                                         node.id, std::current_exception());
                         }
+
+                        co_await update_topology_state(std::move(node.guard), {builder.build(), rtbuilder.build()}, reason);
+
+                        rtlogger.info("rejected node moved to left state {}", node.id);
+
 
                         break;
                     }
