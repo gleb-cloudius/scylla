@@ -109,6 +109,8 @@ enum class stream_reason : uint8_t;
 namespace service {
 
 class group0_peer_exchange;
+template <typename C> class raft_address_map_t;
+using raft_address_map = raft_address_map_t<seastar::lowres_clock>;
 
 }
 
@@ -316,6 +318,7 @@ private:
 private:
     config _cfg;
     locator::shared_token_metadata* _token_metadata = nullptr;
+    service::raft_address_map* _raft_address_map = nullptr;
     // map: Node broadcast address -> Node internal IP, and the reversed mapping, for communication within the same data center
     std::unordered_map<gms::inet_address, gms::inet_address> _preferred_ip_cache, _preferred_to_endpoint;
     std::unique_ptr<rpc_protocol_wrapper> _rpc;
@@ -349,7 +352,7 @@ public:
     ~messaging_service();
 
     future<> start();
-    future<> start_listen(locator::shared_token_metadata& stm);
+    future<> start_listen(locator::shared_token_metadata& stm, service::raft_address_map& am);
     uint16_t port() const noexcept {
         return _cfg.port;
     }

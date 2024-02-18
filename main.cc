@@ -1812,7 +1812,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             group0_service.setup_group0_if_exist(sys_ks.local(), ss.local(), qp.local(), mm.local()).get();
 
             with_scheduling_group(maintenance_scheduling_group, [&] {
-                return messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata));
+                return messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata), std::ref(raft_address_map));
             }).get();
 
             with_scheduling_group(maintenance_scheduling_group, [&] {

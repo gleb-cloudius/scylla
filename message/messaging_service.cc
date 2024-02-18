@@ -47,6 +47,7 @@
 #include "db/per_partition_rate_limit_info.hh"
 #include "service/topology_state_machine.hh"
 #include "service/raft/join_node.hh"
+#include "service/raft/raft_address_map.hh"
 #include "idl/consistency_level.dist.hh"
 #include "idl/tracing.dist.hh"
 #include "idl/result.dist.hh"
@@ -262,8 +263,9 @@ future<> messaging_service::start() {
     return make_ready_future<>();
 }
 
-future<> messaging_service::start_listen(locator::shared_token_metadata& stm) {
+future<> messaging_service::start_listen(locator::shared_token_metadata& stm, service::raft_address_map& am) {
     _token_metadata = &stm;
+    _raft_address_map = &am;
     do_start_listen();
     return make_ready_future<>();
 }

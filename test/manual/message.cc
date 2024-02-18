@@ -25,6 +25,7 @@
 #include "log.hh"
 #include "locator/token_metadata.hh"
 #include "db/schema_tables.hh"
+#include "service/raft/raft_address_map.hh"
 
 using namespace std::chrono_literals;
 using namespace netw;
@@ -207,7 +208,10 @@ int main(int ac, char ** av) {
             auto deinit_testers = deferred_action([&testers] {
                 testers.invoke_on_all(&tester::deinit_handler).get();
             });
-            messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata)).get();
+            sharded<service::raft_address_map> raft_address_map;
+            raft_address_map.start().get();
+            auto stop_am = deferred_stop(raft_address_map);
+            messaging.invoke_on_all(&netw::messaging_service::start_listen, std::ref(token_metadata), std::ref(raft_address_map)).get();
             if (config.contains("server")) {
                 auto ip = config["server"].as<std::string>();
                 auto cpuid = config["cpuid"].as<uint32_t>();

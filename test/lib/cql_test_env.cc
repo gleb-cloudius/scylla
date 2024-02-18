@@ -663,7 +663,7 @@ private:
             auto stop_ms = defer([this] { _ms.stop().get(); });
 
             if (cfg_in.ms_listen) {
-                _ms.invoke_on_all(&netw::messaging_service::start_listen, std::ref(_token_metadata)).get();
+                _ms.invoke_on_all(&netw::messaging_service::start_listen, std::ref(_token_metadata), std::ref(_raft_address_map)).get();
             }
 
             // Normally the auth server is already stopped in here,
