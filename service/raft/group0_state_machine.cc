@@ -59,7 +59,7 @@ group0_state_machine::group0_state_machine(raft_group0_client& client, migration
             // to the system.topology table (namely, to the `upgrade_state` column).
             // If some node at that point didn't mark the feature as enabled
             // locally, there is a risk that it might try to pull a snapshot
-            // and will decide not to use `raft_pull_topology_snapshot` verb.
+            // and will decide not to use `raft_pull_snapshot` verb.
             //
             // The above issue is mitigated by requiring administrators to
             // wait until the SUPPORTS_CONSISTENT_TOPOLOGY_CHANGES feature
@@ -265,16 +265,19 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
         on_internal_error(slogger, "Expected MIGRATION_REQUEST to return canonical mutations");
     }
 
-    std::optional<service::raft_topology_snapshot> topology_snp;
-    std::optional<service::raft_snapshot> auth_snp;
+    std::optional<service::raft_snapshot> snp;
     if (_topology_change_enabled) {
-        topology_snp = co_await ser::storage_service_rpc_verbs::send_raft_pull_topology_snapshot(&_mm._messaging, addr, as, from_id, service::raft_topology_pull_params{});
-
+        auto auth_tables = db::system_auth_keyspace::all_tables();
         std::vector<table_id> tables;
-        for (const auto& schema : db::system_auth_keyspace::all_tables()) {
+        tables.reserve(auth_tables.size() + 3);
+        tables.push_back(db::system_keyspace::topology()->id());
+        tables.push_back(db::system_keyspace::topology_requests()->id());
+        tables.push_back(db::system_keyspace::cdc_generations_v3()->id());
+
+        for (const auto& schema : auth_tables) {
             tables.push_back(schema->id());
         }
-        auth_snp = co_await ser::storage_service_rpc_verbs::send_raft_pull_snapshot(
+        snp = co_await ser::storage_service_rpc_verbs::send_raft_pull_snapshot(
             &_mm._messaging, addr, as, from_id, service::raft_snapshot_pull_params{std::move(tables)});
     }
 
@@ -286,14 +289,10 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
 
     co_await _mm.merge_schema_from(addr, std::move(*cm));
 
-    if (topology_snp && !topology_snp->topology_mutations.empty()) {
-        co_await _ss.merge_topology_snapshot(std::move(*topology_snp));
+    if (snp && !snp->mutations.empty()) {
+        co_await mutate_locally(std::move(snp->mutations), _sp);
         // Flush so that current supported and enabled features are readable before commitlog replay
         co_await _sp.get_db().local().flush(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
-    }
-
-    if (auth_snp) {
-        co_await mutate_locally(std::move(auth_snp->mutations), _sp);
     }
 
     co_await _sp.mutate_locally({std::move(history_mut)}, nullptr);

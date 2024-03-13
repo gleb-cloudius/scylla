@@ -706,30 +706,6 @@ future<> storage_service::topology_transition() {
     _topology_state_machine.event.broadcast();
 }
 
-future<> storage_service::merge_topology_snapshot(raft_topology_snapshot snp) {
-   std::vector<mutation> muts;
-   muts.reserve(snp.topology_mutations.size() + snp.cdc_generation_mutations.size() + snp.topology_requests_mutations.size());
-   {
-       auto s = _db.local().find_schema(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
-       boost::transform(snp.topology_mutations, std::back_inserter(muts), [s] (const canonical_mutation& m) {
-           return m.to_mutation(s);
-       });
-   }
-   if (snp.cdc_generation_mutations.size() > 0) {
-       auto s = _db.local().find_schema(db::system_keyspace::NAME, db::system_keyspace::CDC_GENERATIONS_V3);
-       boost::transform(snp.cdc_generation_mutations, std::back_inserter(muts), [s] (const canonical_mutation& m) {
-           return m.to_mutation(s);
-       });
-   }
-   if (snp.topology_requests_mutations.size()) {
-       auto s = _db.local().find_schema(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY_REQUESTS);
-       boost::transform(snp.topology_requests_mutations, std::back_inserter(muts), [s] (const canonical_mutation& m) {
-           return m.to_mutation(s);
-       });
-   }
-   co_await _db.local().apply(freeze(muts), db::no_timeout);
-}
-
 // Moves the coroutine lambda onto the heap and extends its
 // lifetime until the resulting future is completed.
 // This allows to use captures in coroutine lambda after co_await-s.
@@ -6171,46 +6147,6 @@ void storage_service::init_messaging_service(bool raft_topology_change_enabled) 
         ser::storage_service_rpc_verbs::register_raft_topology_cmd(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, raft::term_t term, uint64_t cmd_index, raft_topology_cmd cmd) {
             return handle_raft_rpc(dst_id, [cmd = std::move(cmd), term, cmd_index] (auto& ss) {
                 return ss.raft_topology_cmd_handler(term, cmd_index, cmd);
-            });
-        });
-        ser::storage_service_rpc_verbs::register_raft_pull_topology_snapshot(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, raft_topology_pull_params params) {
-            return handle_raft_rpc(dst_id, [] (storage_service& ss) -> future<raft_topology_snapshot> {
-                std::vector<canonical_mutation> topology_mutations;
-                {
-                    // FIXME: make it an rwlock, here we only need to lock for reads,
-                    // might be useful if multiple nodes are trying to pull concurrently.
-                    auto read_apply_mutex_holder = co_await ss._group0->client().hold_read_apply_mutex();
-                    topology_mutations = co_await ss.get_system_mutations(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
-                }
-
-                std::vector<canonical_mutation> cdc_generation_mutations;
-                {
-                    // FIXME: when we bootstrap nodes in quick succession, the timestamp of the newest CDC generation
-                    // may be for some time larger than the clocks of our nodes. The last bootstrapped node will only
-                    // read the newest CDC generation into memory and not earlier ones, so it will only be able
-                    // to coordinate writes to CDC-enabled tables after its clock advances to reach the newest
-                    // generation's timestamp. In other words, it may not be able to coordinate writes for some
-                    // time after bootstrapping and drivers connecting to it will receive errors.
-                    // To fix that, we could store in topology a small history of recent CDC generation IDs
-                    // (garbage-collected with time) instead of just the last one, and load all of them.
-                    // Alternatively, a node would wait for some time before switching to normal state.
-                    auto read_apply_mutex_holder = co_await ss._group0->client().hold_read_apply_mutex();
-                    cdc_generation_mutations = co_await ss.get_system_mutations(db::system_keyspace::NAME, db::system_keyspace::CDC_GENERATIONS_V3);
-                }
-
-                std::vector<canonical_mutation> topology_requests_mutations;
-                {
-                    // FIXME: make it an rwlock, here we only need to lock for reads,
-                    // might be useful if multiple nodes are trying to pull concurrently.
-                    auto read_apply_mutex_holder = co_await ss._group0->client().hold_read_apply_mutex();
-                    topology_requests_mutations = co_await ss.get_system_mutations(db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY_REQUESTS);
-                }
-
-                co_return raft_topology_snapshot{
-                    .topology_mutations = std::move(topology_mutations),
-                    .cdc_generation_mutations = std::move(cdc_generation_mutations),
-                    .topology_requests_mutations = std::move(topology_requests_mutations),
-                };
             });
         });
         ser::storage_service_rpc_verbs::register_raft_pull_snapshot(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, raft_snapshot_pull_params params) {
