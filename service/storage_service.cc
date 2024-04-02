@@ -3012,6 +3012,7 @@ future<> storage_service::stop() {
     co_await std::move(_node_ops_abort_thread);
     _tablet_split_monitor_event.signal();
     co_await std::move(_tablet_split_monitor);
+    _gossiper.set_topology_state_machine(nullptr);
 }
 
 future<> storage_service::wait_for_group0_stop() {
@@ -6888,6 +6889,11 @@ future<> storage_service::node_ops_abort_thread() {
         }
     }
     __builtin_unreachable();
+}
+
+void storage_service::set_topology_change_kind(topology_change_kind kind) {
+    _topology_change_kind_enabled = kind;
+    _gossiper.set_topology_state_machine(kind == topology_change_kind::raft ? & _topology_state_machine : nullptr);
 }
 
 } // namespace service
