@@ -541,7 +541,20 @@ future<> storage_service::sync_raft_topology_nodes(mutable_token_metadata_ptr tm
             tmptr->update_topology(replaced_host_id, std::nullopt, locator::node::state::being_replaced);
             update_topology(host_id, ip, rs);
             tmptr->add_replacing_endpoint(replaced_host_id, host_id);
-            co_await update_topology_change_info(tmptr, ::format("replacing {}/{} by {}/{}", replaced_id, *existing_ip, id, ip));
+            if (t.tstate != service::topology::transition_state::join_group0) {
+                // do not update pending ranges yet. After adding replacing endpoint above the node will no longer
+                // be reported for reads and writes, but it needs to be marked as alive alive before it is reported
+                // as pending. Otherwise increased CL during bootstrap will not be satisfied (replaced node cannot
+                // be contacted and replacing is reported as dead).
+                co_await update_topology_change_info(tmptr, ::format("replacing {}/{} by {}/{}", replaced_id, *existing_ip, id, ip));
+            } else {
+                // The node started report itself as alive already, but this node may still not noticed it.
+                // Force the node to be UP. If it is down it will be marked as such eventually, but if
+                // it is up do not marking it as such will cause write queries to fail.
+                if (existing_ip == ip && !_gossiper.is_alive(*existing_ip)) {
+                    co_await _gossiper.real_mark_alive(*existing_ip);
+                }
+            }
         }
             break;
         case node_state::rebuilding:
