@@ -1051,17 +1051,16 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_pr
     tracing::add_query(trace_state, query);
     tracing::begin(trace_state, "Preparing CQL3 query", client_state.get_client_address());
 
-    return _server._query_processor.invoke_on_others([query, &client_state] (auto& qp) mutable {
-            return qp.prepare(std::move(query), client_state).discard_result();
-    }).then([this, query, stream, &client_state, trace_state] () mutable {
-        tracing::trace(trace_state, "Done preparing on remote shards");
-        return _server._query_processor.local().prepare(std::move(query), client_state).then([this, stream, trace_state] (auto msg) {
-            tracing::trace(trace_state, "Done preparing on a local shard - preparing a result. ID is [{}]", seastar::value_of([&msg] {
-                return messages::result_message::prepared::cql::get_id(msg);
-            }));
-            return make_result(stream, *msg, trace_state, _version);
-        });
+    co_await _server._query_processor.invoke_on_others([query, &client_state] (auto& qp) mutable -> future<> {
+            (void)co_await qp.prepare(std::move(query), client_state);
     });
+
+    tracing::trace(trace_state, "Done preparing on remote shards");
+    auto msg = co_await _server._query_processor.local().prepare(std::move(query), client_state);
+    tracing::trace(trace_state, "Done preparing on a local shard - preparing a result. ID is [{}]", seastar::value_of([&msg] {
+        return messages::result_message::prepared::cql::get_id(msg);
+    }));
+    co_return make_result(stream, *msg, trace_state, _version);
 }
 
 static future<process_fn_return_type>
