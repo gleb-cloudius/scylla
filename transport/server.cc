@@ -816,51 +816,49 @@ future<fragmented_temporary_buffer> cql_server::connection::read_and_decompress_
             if (length < 4) {
                 throw std::runtime_error(fmt::format("CQL frame truncated: expected to have at least 4 bytes, got {}", length));
             }
-            return _buffer_reader.read_exactly(_read_buf, length).then([] (fragmented_temporary_buffer buf) {
-                auto input_buffer = input_buffer_guard();
-                auto output_buffer = output_buffer_guard();
-                auto v = fragmented_temporary_buffer::view(buf);
-                int32_t uncomp_len = read_simple<int32_t>(v);
-                if (uncomp_len < 0) {
-                    throw std::runtime_error("CQL frame uncompressed length is negative: " + std::to_string(uncomp_len));
+            auto buf = co_await _buffer_reader.read_exactly(_read_buf, length);
+            auto input_buffer = input_buffer_guard();
+            auto output_buffer = output_buffer_guard();
+            auto v = fragmented_temporary_buffer::view(buf);
+            int32_t uncomp_len = read_simple<int32_t>(v);
+            if (uncomp_len < 0) {
+                throw std::runtime_error("CQL frame uncompressed length is negative: " + std::to_string(uncomp_len));
+            }
+            auto in = input_buffer.get_linearized_view(v);
+            co_return output_buffer.make_fragmented_temporary_buffer(uncomp_len, [&in] (bytes_mutable_view out) {
+                auto ret = LZ4_decompress_safe(reinterpret_cast<const char*>(in.data()), reinterpret_cast<char*>(out.data()), in.size(), out.size());
+                if (ret < 0) {
+                    throw std::runtime_error("CQL frame LZ4 uncompression failure");
                 }
-                auto in = input_buffer.get_linearized_view(v);
-                return output_buffer.make_fragmented_temporary_buffer(uncomp_len, [&in] (bytes_mutable_view out) {
-                    auto ret = LZ4_decompress_safe(reinterpret_cast<const char*>(in.data()), reinterpret_cast<char*>(out.data()), in.size(), out.size());
-                    if (ret < 0) {
-                        throw std::runtime_error("CQL frame LZ4 uncompression failure");
-                    }
-                    if (static_cast<size_t>(ret) != out.size()) {  // ret is known to be positive here
-                        throw std::runtime_error("Malformed CQL frame - provided uncompressed size different than real uncompressed size");
-                    }
-                    return static_cast<size_t>(ret);
-                });
+                if (static_cast<size_t>(ret) != out.size()) {  // ret is known to be positive here
+                    throw std::runtime_error("Malformed CQL frame - provided uncompressed size different than real uncompressed size");
+                }
+                return static_cast<size_t>(ret);
             });
         } else if (_compression == cql_compression::snappy) {
-            return _buffer_reader.read_exactly(_read_buf, length).then([] (fragmented_temporary_buffer buf) {
-                auto input_buffer = input_buffer_guard();
-                auto output_buffer = output_buffer_guard();
-                auto in = input_buffer.get_linearized_view(fragmented_temporary_buffer::view(buf));
-                size_t uncomp_len;
-                if (snappy_uncompressed_length(reinterpret_cast<const char*>(in.data()), in.size(), &uncomp_len) != SNAPPY_OK) {
-                    throw std::runtime_error("CQL frame Snappy uncompressed size is unknown");
+            auto buf = co_await _buffer_reader.read_exactly(_read_buf, length);
+            auto input_buffer = input_buffer_guard();
+            auto output_buffer = output_buffer_guard();
+            auto in = input_buffer.get_linearized_view(fragmented_temporary_buffer::view(buf));
+            size_t uncomp_len;
+            if (snappy_uncompressed_length(reinterpret_cast<const char*>(in.data()), in.size(), &uncomp_len) != SNAPPY_OK) {
+                throw std::runtime_error("CQL frame Snappy uncompressed size is unknown");
+            }
+            co_return output_buffer.make_fragmented_temporary_buffer(uncomp_len, [&in] (bytes_mutable_view out) {
+                size_t output_len = out.size();
+                if (snappy_uncompress(reinterpret_cast<const char*>(in.data()), in.size(), reinterpret_cast<char*>(out.data()), &output_len) != SNAPPY_OK) {
+                    throw std::runtime_error("CQL frame Snappy uncompression failure");
                 }
-                return output_buffer.make_fragmented_temporary_buffer(uncomp_len, [&in] (bytes_mutable_view out) {
-                    size_t output_len = out.size();
-                    if (snappy_uncompress(reinterpret_cast<const char*>(in.data()), in.size(), reinterpret_cast<char*>(out.data()), &output_len) != SNAPPY_OK) {
-                        throw std::runtime_error("CQL frame Snappy uncompression failure");
-                    }
-                    if (output_len != out.size()) {
-                        throw std::runtime_error("Malformed CQL frame - provided uncompressed size different than real uncompressed size");
-                    }
-                    return output_len;
-                });
+                if (output_len != out.size()) {
+                    throw std::runtime_error("Malformed CQL frame - provided uncompressed size different than real uncompressed size");
+                }
+                return output_len;
             });
         } else {
             throw exceptions::protocol_exception(format("Unknown compression algorithm"));
         }
     }
-    return _buffer_reader.read_exactly(_read_buf, length);
+    co_return co_await _buffer_reader.read_exactly(_read_buf, length);
 }
 
 future<std::unique_ptr<cql_server::response>> cql_server::connection::process_startup(uint16_t stream, request_reader in, service::client_state& client_state,
