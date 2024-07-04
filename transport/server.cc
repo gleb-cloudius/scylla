@@ -927,18 +927,13 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_au
     auto buf = in.read_raw_bytes_view(in.bytes_left());
     auto challenge = sasl_challenge->evaluate_response(buf);
     if (sasl_challenge->is_complete()) {
-        return sasl_challenge->get_authenticated_user().then([this, sasl_challenge, stream, &client_state, challenge = std::move(challenge), trace_state](auth::authenticated_user user) mutable {
-            client_state.set_login(std::move(user));
-            auto f = client_state.check_user_can_login();
-            f = f.then([&client_state] {
-                return client_state.maybe_update_per_service_level_params();
-            });
-            return f.then([this, stream, challenge = std::move(challenge), trace_state]() mutable {
-                return make_ready_future<std::unique_ptr<cql_server::response>>(make_auth_success(stream, std::move(challenge), trace_state));
-            });
-        });
+        auto user = co_await sasl_challenge->get_authenticated_user();
+        client_state.set_login(std::move(user));
+        co_await client_state.check_user_can_login();
+        co_await client_state.maybe_update_per_service_level_params();
+        co_return make_auth_success(stream, std::move(challenge), trace_state);
     }
-    return make_ready_future<std::unique_ptr<cql_server::response>>(make_auth_challenge(stream, std::move(challenge), trace_state));
+    co_return make_auth_challenge(stream, std::move(challenge), trace_state);
 }
 
 future<std::unique_ptr<cql_server::response>> cql_server::connection::process_options(uint16_t stream, request_reader in, service::client_state& client_state,
