@@ -689,6 +689,11 @@ private:
                 return make_ready_future<>();
             }).get();
 
+            _raft_address_map.start().get();
+            auto stop_address_map = defer([this] {
+                _raft_address_map.stop().get();
+            });
+
             uint16_t port = 7000;
             seastar::server_socket tmp;
 
@@ -709,7 +714,7 @@ private:
                        port = tmp.local_address().port();
                     }
                     // Don't start listening so tests can be run in parallel if cfg_in.ms_listen is not set to true explicitly.
-                    _ms.start(host_id, listen, std::move(port), std::ref(_feature_service)).get();
+                    _ms.start(host_id, listen, std::move(port), std::ref(_feature_service), std::ref(_raft_address_map)).get();
                     stop_ms = defer(stop_type(stop_ms_func));
 
                     if (cfg_in.ms_listen) {
@@ -765,11 +770,6 @@ private:
                 _gossiper.stop().get();
             });
             _gossiper.invoke_on_all(&gms::gossiper::start).get();
-
-            _raft_address_map.start().get();
-            auto stop_address_map = defer([this] {
-                _raft_address_map.stop().get();
-            });
 
             _fd_pinger.start(std::ref(_ms), std::ref(_raft_address_map)).get();
             auto stop_fd_pinger = defer([this] { _fd_pinger.stop().get(); });

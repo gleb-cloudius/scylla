@@ -1328,6 +1328,13 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
               }
             }
 
+            static sharded<service::raft_address_map> raft_address_map;
+            supervisor::notify("starting Raft address map");
+            raft_address_map.start().get();
+            auto stop_address_map = defer_verbose_shutdown("raft_address_map", [] {
+                raft_address_map.stop().get();
+            });
+
             sys_ks.local().build_bootstrap_info().get();
 
             const auto listen_address = utils::resolve(cfg->listen_address, family).get();
@@ -1406,7 +1413,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }
 
             // Delay listening messaging_service until gossip message handlers are registered
-            messaging.start(mscfg, scfg, creds, std::ref(feature_service)).get();
+            messaging.start(mscfg, scfg, creds, std::ref(feature_service), std::ref(raft_address_map)).get();
             auto stop_ms = defer_verbose_shutdown("messaging service", [&messaging] {
                 messaging.invoke_on_all(&netw::messaging_service::stop).get();
             });
@@ -1475,13 +1482,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             api::set_server_gossip(ctx, gossiper).get();
             auto stop_gossip_api = defer_verbose_shutdown("gossiper API", [&ctx] {
                 api::unset_server_gossip(ctx).get();
-            });
-
-            static sharded<service::raft_address_map> raft_address_map;
-            supervisor::notify("starting Raft address map");
-            raft_address_map.start().get();
-            auto stop_address_map = defer_verbose_shutdown("raft_address_map", [] {
-                raft_address_map.stop().get();
             });
 
             utils::get_local_injector().inject("stop_after_starting_raft_address_map",

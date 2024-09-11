@@ -59,6 +59,7 @@ int main(int ac, char ** av) {
             sharded<abort_source> abort_sources;
             sharded<locator::shared_token_metadata> token_metadata;
             sharded<gms::feature_service> feature_service;
+            sharded<service::raft_address_map> raft_address_map;
             sharded<netw::messaging_service> messaging;
 
             abort_sources.start().get();
@@ -74,7 +75,9 @@ int main(int ac, char ** av) {
             auto cfg = gms::feature_config_from_db_config(db::config(), {});
             feature_service.start(cfg).get();
 
-            messaging.start(locator::host_id{}, listen, 7000, std::ref(feature_service)).get();
+            raft_address_map.start().get();
+
+            messaging.start(locator::host_id{}, listen, 7000, std::ref(feature_service), std::ref(raft_address_map)).get();
             auto stop_messaging = deferred_stop(messaging);
 
             gms::gossip_config gcfg;
