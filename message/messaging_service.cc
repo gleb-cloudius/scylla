@@ -678,7 +678,7 @@ static constexpr std::array<uint8_t, static_cast<size_t>(messaging_verb::LAST)> 
 static std::array<uint8_t, static_cast<size_t>(messaging_verb::LAST)> s_rpc_client_idx_table = make_rpc_client_idx_table();
 
 msg_addr messaging_service::addr_for_host_id(locator::host_id hid) {
-    auto opt_ip = _address_map.find(raft::server_id{hid.uuid()});
+    auto opt_ip = _address_map.find(hid);
     if (!opt_ip) {
         throw std::runtime_error(::format("no ip address mapping for {}", hid));
     }
