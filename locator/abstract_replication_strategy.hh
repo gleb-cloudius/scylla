@@ -268,7 +268,22 @@ public:
     const token_metadata& get_token_metadata() const noexcept { return *_tmptr; }
     const token_metadata_ptr& get_token_metadata_ptr() const noexcept { return _tmptr; }
     const topology& get_topology() const noexcept { return _tmptr->get_topology(); }
+
+    // Get the replication factor across all data centers from the schema replication strategy (as per settings).
     size_t get_schema_replication_factor() const noexcept { return _replication_factor; }
+
+    // Get the total replication factor for a token across all data centers.
+    // The VNode implementation ignores the token parameter and returns the same value as `get_schema_replication_factor()`.
+    // The Tablets implementation accounts for any ongoing migrations and returns the actual sum across all data centers.
+    // If Tablets are not in transition, this should return the same value as `get_schema_replication_factor()`.
+    [[nodiscard]] virtual size_t get_replication_factor(dht::token id) const = 0;
+
+    // Get the replication factor for a token and specified data center.
+    // The VNode implementation ignores the token parameter and returns the replication factor (RF)
+    // based on the network replication strategy.
+    // The Tablets implementation accounts for potential ongoing migrations and returns the actual
+    // number of replicas in the data center.
+    [[nodiscard]] virtual size_t get_replication_factor(dht::token id, const seastar::sstring& datacenter) const = 0;
 
     void invalidate() const noexcept {
         _validity_abort_source->request_abort();
@@ -528,6 +543,22 @@ public:
 
     virtual future<mutable_static_effective_replication_map_ptr> clone_gently(replication_strategy_ptr rs, token_metadata_ptr tmptr) const override;
 
+    [[nodiscard]] size_t get_replication_factor([[maybe_unused]] const dht::token id) const override {
+        return get_schema_replication_factor();
+    }
+
+    [[nodiscard]] size_t get_replication_factor(dht::token id, const seastar::sstring& datacenter) const override;
+
+    struct cloned_data {
+        replication_map replication_map;
+        ring_mapping pending_endpoints;
+        ring_mapping read_endpoints;
+        std::unordered_set<locator::host_id> dirty_endpoints;
+    };
+    // boost::icl::interval_map is not no_throw_move_constructible -> can't return cloned_data by val,
+    // since future_state requires T to be no_throw_move_constructible.
+    future<std::unique_ptr<cloned_data>> clone_data_gently() const;
+
     // get_primary_ranges() returns the list of "primary ranges" for the given
     // endpoint. "Primary ranges" are the ranges that the node is responsible
     // for storing replica primarily, which means this is the first node
@@ -608,6 +639,14 @@ public:
 
     virtual const local_effective_replication_map* maybe_as_local_effective_replication_map() const override {
         return this;
+    }
+
+    [[nodiscard]] size_t get_replication_factor([[maybe_unused]] dht::token id) const override {
+        return get_schema_replication_factor();
+    }
+
+    [[nodiscard]] size_t get_replication_factor([[maybe_unused]] dht::token id, [[maybe_unused]] const seastar::sstring& datacenter) const override {
+        return get_schema_replication_factor();
     }
 
     virtual future<mutable_static_effective_replication_map_ptr> clone_gently(replication_strategy_ptr rs, token_metadata_ptr tmptr) const override;
