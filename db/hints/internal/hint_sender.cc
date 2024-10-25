@@ -250,21 +250,19 @@ future<> hint_sender::send_one_mutation(frozen_mutation_and_schema m) {
     auto ermp = _db.find_column_family(m.s).get_effective_replication_map();
     auto token = dht::get_token(*m.s, m.fm.key());
     host_id_vector_replica_set natural_endpoints = ermp->get_natural_replicas(token);
-    host_id_vector_topology_change pending_endpoints  = ermp->get_pending_replicas(token);
 
-    return futurize_invoke([this, m = std::move(m), ermp = std::move(ermp), &natural_endpoints, &pending_endpoints, &token] () mutable -> future<> {
+    return futurize_invoke([this, m = std::move(m), ermp = std::move(ermp), &natural_endpoints, token] () mutable -> future<> {
         // The fact that we send with CL::ALL in both cases below ensures that new hints are not going
         // to be generated as a result of hints sending.
+        const auto& tm = ermp->get_token_metadata();
         const auto dst = end_point_key();
 
-        const bool is_leaving = ermp->is_leaving(dst, token);
-        if (std::ranges::contains(natural_endpoints, dst) && (!is_leaving || !pending_endpoints.empty())) {
-            manager_logger.trace("hint_sender[{}]:send_one_mutation: Sending directly", dst);
-            // dst is not duplicated in pending_endpoints because it's in natural_endpoints
-            return _proxy.send_hint_to_endpoint(std::move(m), std::move(ermp), dst, std::move(pending_endpoints));
+        if (std::ranges::contains(natural_endpoints, dst) && !tm.is_leaving(dst)) {
+            manager_logger.trace("Sending directly to {}", dst);
+            return _proxy.send_hint_to_endpoint(std::move(m), std::move(ermp), dst, token);
         } else {
             if (manager_logger.is_enabled(log_level::trace)) {
-                if (is_leaving) {
+                if (tm.is_leaving(end_point_key())) {
                     manager_logger.trace("hint_sender[{}]:send_one_mutation: Original target host or tablet replica is leaving. Mutating from scratch", dst);
                 } else {
                     manager_logger.trace("hint_sender[{}]:send_one_mutation: Endpoint set has changed and original target is no longer a replica. Mutating from scratch", dst);

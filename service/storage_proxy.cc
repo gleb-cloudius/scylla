@@ -126,8 +126,13 @@ utils::small_vector<locator::host_id, N> addr_vector_to_id(const gms::gossiper& 
 // Check the effective replication map consistency:
 // we have an inconsistent effective replication map in case we the number of
 // read replicas is higher than the replication factor.
-[[maybe_unused]] void validate_read_replicas(const locator::effective_replication_map& erm, const host_id_vector_replica_set& read_replicas) {
-    const sstring error = erm.get_replication_strategy().sanity_check_read_replicas(erm, read_replicas);
+void validate_read_replicas(const locator::effective_replication_map& erm, const host_id_vector_replica_set& read_replicas, const dht::token token) {
+    // Skip for non-debug builds.
+    if constexpr (!tools::build_info::is_debug_build()) {
+        return;
+    }
+
+    const sstring error = erm.get_replication_strategy().sanity_check_read_replicas(erm, read_replicas, token);
     if (!error.empty()) {
         on_internal_error(slogger, error);
     }
@@ -1746,7 +1751,9 @@ public:
             locator::effective_replication_map_ptr erm,
             db::consistency_level cl, db::write_type type,
             std::unique_ptr<mutation_holder> mh, host_id_vector_replica_set targets, tracing::trace_state_ptr trace_state,
-            storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, size_t pending_endpoints = 0,
+            storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info,
+            const dht::token token_id,
+            size_t pending_endpoints = 0,
             host_id_vector_topology_change dead_endpoints = {}, is_cancellable cancellable = is_cancellable::no)
             : _id(p->get_next_response_id()), _proxy(std::move(p))
             , _effective_replication_map_ptr(std::move(erm))
@@ -1756,7 +1763,7 @@ public:
         // original comment from cassandra:
         // during bootstrap, include pending endpoints in the count
         // or we may fail the consistency level guarantees (see #833, #8058)
-        _total_block_for = db::block_for(*_effective_replication_map_ptr, _cl) + pending_endpoints;
+        _total_block_for = db::block_for(*_effective_replication_map_ptr, _cl, token_id) + pending_endpoints;
         ++_stats.writes;
 
         if (cancellable) {
@@ -2039,9 +2046,9 @@ public:
             db::consistency_level cl, db::write_type type,
             std::unique_ptr<mutation_holder> mh, host_id_vector_replica_set targets,
             const host_id_vector_topology_change& pending_endpoints, host_id_vector_topology_change dead_endpoints, tracing::trace_state_ptr tr_state,
-            storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info) :
+            storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, const dht::token token_id) :
                 abstract_write_response_handler(p, ermp, cl, type, std::move(mh), // can't move ermp, it's used below
-                        std::move(targets), std::move(tr_state), stats, std::move(permit), rate_limit_info,
+                        std::move(targets), std::move(tr_state), stats, std::move(permit), rate_limit_info, token_id,
                         ermp->get_topology().count_local_endpoints(pending_endpoints), std::move(dead_endpoints)) {
         _total_endpoints = _effective_replication_map_ptr->get_topology().count_local_endpoints(_targets);
     }
@@ -2057,9 +2064,9 @@ public:
             db::consistency_level cl, db::write_type type,
             std::unique_ptr<mutation_holder> mh, host_id_vector_replica_set targets,
             const host_id_vector_topology_change& pending_endpoints, host_id_vector_topology_change dead_endpoints, tracing::trace_state_ptr tr_state,
-            storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, is_cancellable cancellable) :
+            storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, is_cancellable cancellable, const dht::token token_id) :
                 abstract_write_response_handler(std::move(p), std::move(ermp), cl, type, std::move(mh),
-                        std::move(targets), std::move(tr_state), stats, std::move(permit), rate_limit_info, pending_endpoints.size(), std::move(dead_endpoints), cancellable) {
+                        std::move(targets), std::move(tr_state), stats, std::move(permit), rate_limit_info, token_id, pending_endpoints.size(), std::move(dead_endpoints), cancellable) {
         _total_endpoints = _targets.size();
     }
 };
@@ -2147,8 +2154,8 @@ public:
     datacenter_sync_write_response_handler(shared_ptr<storage_proxy> p, locator::effective_replication_map_ptr ermp, db::consistency_level cl, db::write_type type,
             std::unique_ptr<mutation_holder> mh, host_id_vector_replica_set targets, const host_id_vector_topology_change& pending_endpoints,
             host_id_vector_topology_change dead_endpoints, tracing::trace_state_ptr tr_state, storage_proxy::write_stats& stats, service_permit permit,
-            db::per_partition_rate_limit::info rate_limit_info) :
-        abstract_write_response_handler(std::move(p), std::move(ermp), cl, type, std::move(mh), targets, std::move(tr_state), stats, std::move(permit), rate_limit_info, 0, dead_endpoints) {
+            db::per_partition_rate_limit::info rate_limit_info, const dht::token token_id) :
+        abstract_write_response_handler(std::move(p), std::move(ermp), cl, type, std::move(mh), targets, std::move(tr_state), stats, std::move(permit), rate_limit_info, token_id, 0, dead_endpoints) {
         auto* erm = _effective_replication_map_ptr.get();
         auto& topology = erm->get_topology();
 
@@ -2162,7 +2169,7 @@ public:
                 size_t total_endpoints_for_dc = std::ranges::count_if(targets, [&topology, &dc] (const locator::host_id& ep){
                     return topology.get_datacenter(ep) == dc;
                 });
-                _dc_responses.emplace(dc, dc_info{0, db::local_quorum_for(*erm, dc) + pending_for_dc, total_endpoints_for_dc, 0});
+                _dc_responses.emplace(dc, dc_info{0, db::local_quorum_for(*erm, dc, token_id) + pending_for_dc, total_endpoints_for_dc, 0});
                 _total_block_for += pending_for_dc;
             }
         }
@@ -2892,17 +2899,17 @@ future<result<>> storage_proxy::response_wait(storage_proxy::response_id_type id
 result<storage_proxy::response_id_type> storage_proxy::make_write_response_handler(locator::effective_replication_map_ptr ermp,
                              db::consistency_level cl, db::write_type type, std::unique_ptr<mutation_holder> m,
                              host_id_vector_replica_set targets, const host_id_vector_topology_change& pending_endpoints, host_id_vector_topology_change dead_endpoints, tracing::trace_state_ptr tr_state,
-                             storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, is_cancellable cancellable, bool skip_large_data_guardrails)
+                             storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, is_cancellable cancellable, const dht::token token_id, bool skip_large_data_guardrails)
 {
     shared_ptr<abstract_write_response_handler> h;
     auto& rs = ermp->get_replication_strategy();
 
     if (db::is_datacenter_local(cl)) {
-        h = ::make_shared<datacenter_write_response_handler>(shared_from_this(), std::move(ermp), cl, type, std::move(m), std::move(targets), pending_endpoints, std::move(dead_endpoints), std::move(tr_state), stats, std::move(permit), rate_limit_info);
+        h = ::make_shared<datacenter_write_response_handler>(shared_from_this(), std::move(ermp), cl, type, std::move(m), std::move(targets), pending_endpoints, std::move(dead_endpoints), std::move(tr_state), stats, std::move(permit), rate_limit_info, token_id);
     } else if (cl == db::consistency_level::EACH_QUORUM && rs.get_type() == locator::replication_strategy_type::network_topology){
-        h = ::make_shared<datacenter_sync_write_response_handler>(shared_from_this(), std::move(ermp), cl, type, std::move(m), std::move(targets), pending_endpoints, std::move(dead_endpoints), std::move(tr_state), stats, std::move(permit), rate_limit_info);
+        h = ::make_shared<datacenter_sync_write_response_handler>(shared_from_this(), std::move(ermp), cl, type, std::move(m), std::move(targets), pending_endpoints, std::move(dead_endpoints), std::move(tr_state), stats, std::move(permit), rate_limit_info, token_id);
     } else {
-        h = ::make_shared<write_response_handler>(shared_from_this(), std::move(ermp), cl, type, std::move(m), std::move(targets), pending_endpoints, std::move(dead_endpoints), std::move(tr_state), stats, std::move(permit), rate_limit_info, cancellable);
+        h = ::make_shared<write_response_handler>(shared_from_this(), std::move(ermp), cl, type, std::move(m), std::move(targets), pending_endpoints, std::move(dead_endpoints), std::move(tr_state), stats, std::move(permit), rate_limit_info, cancellable, token_id);
     }
     h->set_skip_large_data_guardrails(skip_large_data_guardrails);
     return bo::success(register_response_handler(std::move(h)));
@@ -3818,10 +3825,10 @@ storage_proxy::create_write_response_handler_helper(schema_ptr s, const dht::tok
     slogger.trace("creating write handler with live: {} dead: {}", live_endpoints, dead_endpoints);
     tracing::trace(tr_state, "Creating write handler with live: {} dead: {}", live_endpoints, dead_endpoints);
 
-    db::assure_sufficient_live_nodes(cl, *erm, live_endpoints, pending_endpoints);
+    db::assure_sufficient_live_nodes(cl, *erm, live_endpoints, token, pending_endpoints);
 
     return make_write_response_handler(std::move(erm), cl, type, std::move(mh), std::move(live_endpoints), pending_endpoints,
-            std::move(dead_endpoints), std::move(tr_state), get_stats(), std::move(permit), rate_limit_info, cancellable, options.bypass_large_data_guardrails);
+            std::move(dead_endpoints), std::move(tr_state), get_stats(), std::move(permit), rate_limit_info, cancellable, token, options.bypass_large_data_guardrails);
 }
 
 /**
@@ -3859,11 +3866,12 @@ storage_proxy::create_write_response_handler(const read_repair_mutation& mut, db
 
     slogger.trace("creating write handler for read repair token: {} endpoint: {}", mh->token(), endpoints);
     tracing::trace(tr_state, "Creating write handler for read repair token: {} endpoint: {}", mh->token(), endpoints);
+    const dht::token token_id = mh->token();
 
     // No rate limiting for read repair
     // Read repair unconditionally skips large data guardrails — the data already
     // exists on a replica; rejecting would cause inconsistency.
-    return make_write_response_handler(std::move(mut.ermp), cl, type, std::move(mh), std::move(endpoints), host_id_vector_topology_change(), host_id_vector_topology_change(), std::move(tr_state), get_stats(), std::move(permit), std::monostate(), is_cancellable::no, /*skip_large_data_guardrails=*/ true);
+    return make_write_response_handler(std::move(mut.ermp), cl, type, std::move(mh), std::move(endpoints), host_id_vector_topology_change(), host_id_vector_topology_change(), std::move(tr_state), get_stats(), std::move(permit), std::monostate(), is_cancellable::no, token_id, /*skip_large_data_guardrails=*/ true);
 }
 
 result<storage_proxy::response_id_type>
@@ -3893,7 +3901,7 @@ storage_proxy::create_write_response_handler(const std::tuple<lw_shared_ptr<paxo
 
     // No rate limiting for paxos (yet)
     return make_write_response_handler(std::move(ermp), cl, db::write_type::CAS, std::make_unique<cas_mutation>(std::move(commit), s, nullptr), std::move(endpoints),
-                    host_id_vector_topology_change(), host_id_vector_topology_change(), std::move(tr_state), get_stats(), std::move(permit), std::monostate(), is_cancellable::no);
+                    host_id_vector_topology_change(), host_id_vector_topology_change(), std::move(tr_state), get_stats(), std::move(permit), std::monostate(), is_cancellable::no, token);
 }
 
 // After sending the write to replicas(targets), the replicas might generate send view updates. If the number of view updates
@@ -4046,7 +4054,7 @@ locator::host_id storage_proxy::find_leader_for_counter_update(const mutation& m
     auto live_endpoints = get_live_endpoints(erm, m.token());
 
     if (live_endpoints.empty()) {
-        throw exceptions::unavailable_exception(cl, block_for(erm, cl), 0);
+        throw exceptions::unavailable_exception(cl, block_for(erm, cl, m.token()), 0);
     }
 
     const auto my_address = my_host_id(erm);
@@ -4102,6 +4110,8 @@ future<> storage_proxy::mutate_counters(Range&& mutations, db::consistency_level
     auto my_address = my_host_id(**erms.begin());
     co_await coroutine::parallel_for_each(leaders, [this, cl, timeout, tr_state = std::move(tr_state), permit = std::move(permit), my_address, fence] (auto& endpoint_and_mutations) -> future<> {
       auto first_schema = endpoint_and_mutations.second[0].s;
+      assert(first_schema);
+      const dht::token first_token = endpoint_and_mutations.second[0].fm.token(*first_schema);
 
       try {
         auto endpoint = endpoint_and_mutations.first;
@@ -4141,14 +4151,14 @@ future<> storage_proxy::mutate_counters(Range&& mutations, db::consistency_level
                 std::rethrow_exception(std::move(exp));
             } catch (rpc::timeout_error&) {
                 get_stats().write_timeouts.mark();
-                throw mutation_write_timeout_exception(s->ks_name(), s->cf_name(), cl, 0, db::block_for(*erm, cl), db::write_type::COUNTER);
+                throw mutation_write_timeout_exception(s->ks_name(), s->cf_name(), cl, 0, db::block_for(*erm, cl, first_token), db::write_type::COUNTER);
             } catch (timed_out_error&) {
                 get_stats().write_timeouts.mark();
-                throw mutation_write_timeout_exception(s->ks_name(), s->cf_name(), cl, 0, db::block_for(*erm, cl), db::write_type::COUNTER);
+                throw mutation_write_timeout_exception(s->ks_name(), s->cf_name(), cl, 0, db::block_for(*erm, cl, first_token), db::write_type::COUNTER);
             } catch (rpc::closed_error&) {
-                throw mutation_write_failure_exception(s->ks_name(), s->cf_name(), cl, 0, 1, db::block_for(*erm, cl), db::write_type::COUNTER);
+                throw mutation_write_failure_exception(s->ks_name(), s->cf_name(), cl, 0, 1, db::block_for(*erm, cl, first_token), db::write_type::COUNTER);
             } catch (replica::stale_topology_exception& e) {
-                throw mutation_write_failure_exception(e.what(), cl, 0, 1, db::block_for(*erm, cl), db::write_type::COUNTER);
+                throw mutation_write_failure_exception(e.what(), cl, 0, 1, db::block_for(*erm, cl, first_token), db::write_type::COUNTER);
             }
         }
       }
@@ -4478,7 +4488,7 @@ storage_proxy::mutate_atomically_result(utils::chunked_vector<mutation> mutation
 
         future<result<>> send_batchlog_mutation(mutation m, db::consistency_level cl = db::consistency_level::ONE) {
             return _p.mutate_prepare<>(std::array<mutation, 1>{std::move(m)}, [this, cl, permit = _permit] (const mutation& m) {
-                return _p.make_write_response_handler(_ermp, cl, db::write_type::BATCH_LOG, std::make_unique<shared_mutation>(m), _batchlog_endpoints, {}, {}, _trace_state, _stats, permit, std::monostate(), is_cancellable::no);
+                return _p.make_write_response_handler(_ermp, cl, db::write_type::BATCH_LOG, std::make_unique<shared_mutation>(m), _batchlog_endpoints, {}, {}, _trace_state, _stats, permit, std::monostate(), is_cancellable::no, m.token());
             }).then(utils::result_wrap([this, cl] (unique_response_handler_vector ids) {
                 _p.register_cdc_operation_result_tracker(ids, _cdc_tracker);
                 return _p.mutate_begin(std::move(ids), cl, _trace_state, _timeout);
@@ -4565,7 +4575,8 @@ future<> storage_proxy::send_to_endpoint(
         tracing::trace_state_ptr tr_state,
         write_stats& stats,
         allow_hints allow_hints,
-        is_cancellable cancellable) {
+        is_cancellable cancellable,
+        const dht::token token_id) {
     utils::latency_counter lc;
     lc.start();
 
@@ -4578,7 +4589,7 @@ future<> storage_proxy::send_to_endpoint(
     }
 
     return mutate_prepare(std::array{std::move(m)},
-            [this, tr_state, erm = std::move(ermp), target = std::array{target}, pending_endpoints, &stats, cancellable, cl, type, /* does view building should hold a real permit */ permit = empty_service_permit()] (std::unique_ptr<mutation_holder>& m) mutable {
+            [this, tr_state, erm = std::move(ermp), target = std::array{target}, pending_endpoints, &stats, cancellable, cl, type, /* does view building should hold a real permit */ permit = empty_service_permit(), token_id] (std::unique_ptr<mutation_holder>& m) mutable {
         host_id_vector_replica_set targets;
         targets.reserve(pending_endpoints.size() + 1);
         host_id_vector_topology_change dead_endpoints;
@@ -4588,7 +4599,7 @@ future<> storage_proxy::send_to_endpoint(
                 std::back_inserter(dead_endpoints),
                 std::bind_front(&storage_proxy::is_alive, this, std::cref(*erm)));
         slogger.trace("Creating write handler with live: {}; dead: {}", targets, dead_endpoints);
-        db::assure_sufficient_live_nodes(cl, *erm, targets, pending_endpoints);
+        db::assure_sufficient_live_nodes(cl, *erm, targets, token_id, pending_endpoints);
         return make_write_response_handler(
             std::move(erm),
             cl,
@@ -4601,7 +4612,8 @@ future<> storage_proxy::send_to_endpoint(
             stats,
             permit,
             std::monostate(), // TODO: Pass the correct enforcement type
-            cancellable);
+            cancellable,
+            token_id);
     }).then(utils::result_wrap([this, cl, tr_state = std::move(tr_state), timeout = std::move(timeout)] (unique_response_handler_vector ids) mutable {
         return mutate_begin(std::move(ids), cl, std::move(tr_state), std::move(timeout));
     })).then_wrapped([p = shared_from_this(), lc, &stats] (future<result<>> f) {
@@ -4617,7 +4629,8 @@ future<> storage_proxy::send_to_endpoint(
         db::write_type type,
         tracing::trace_state_ptr tr_state,
         allow_hints allow_hints,
-        is_cancellable cancellable) {
+        is_cancellable cancellable,
+        const dht::token token_id) {
     return send_to_endpoint(
             std::make_unique<shared_mutation>(std::move(fm_a_s)),
             std::move(ermp),
@@ -4627,20 +4640,22 @@ future<> storage_proxy::send_to_endpoint(
             std::move(tr_state),
             get_stats(),
             allow_hints,
-            cancellable);
+            cancellable,
+            token_id);
 }
 
-future<> storage_proxy::send_hint_to_endpoint(frozen_mutation_and_schema fm_a_s, locator::effective_replication_map_ptr ermp, locator::host_id target, host_id_vector_topology_change pending_endpoints) {
+future<> storage_proxy::send_hint_to_endpoint(frozen_mutation_and_schema fm_a_s, locator::effective_replication_map_ptr ermp, locator::host_id target, const dht::token token_id) {
     return send_to_endpoint(
             std::make_unique<hint_mutation>(std::move(fm_a_s)),
             std::move(ermp),
             std::move(target),
-            std::move(pending_endpoints),
+            {},
             db::write_type::SIMPLE,
             tracing::trace_state_ptr(),
             get_stats(),
             allow_hints::no,
-            is_cancellable::yes);
+            is_cancellable::yes,
+            token_id);
 }
 
 future<> storage_proxy::send_hint_to_all_replicas(frozen_mutation_and_schema fm_a_s) {
@@ -6168,14 +6183,14 @@ result<::shared_ptr<abstract_read_executor>> storage_proxy::get_read_executor(lw
     auto cf = _db.local().find_column_family(schema).shared_from_this();
     host_id_vector_replica_set target_replicas = filter_replicas_for_read(cl, *erm, all_replicas, preferred_endpoints, repair_decision,
             retry_type == speculative_retry::type::NONE ? nullptr : &extra_replica,
-            _db.local().get_config().cache_hit_rate_read_balancing() ? &*cf : nullptr);
+            _db.local().get_config().cache_hit_rate_read_balancing() ? &*cf : nullptr, token);
 
     slogger.trace("creating read executor for token {} with all: {} targets: {} rp decision: {}", token, all_replicas, target_replicas, repair_decision);
     tracing::trace(trace_state, "Creating read executor for token {} with all: {} targets: {} repair decision: {}", token, all_replicas, target_replicas, repair_decision);
 
     // Throw UAE early if we don't have enough replicas.
     try {
-        db::assure_sufficient_live_nodes(cl, *erm, target_replicas, host_id_vector_topology_change{});
+        db::assure_sufficient_live_nodes(cl, *erm, target_replicas, token,  host_id_vector_topology_change{});
     } catch (exceptions::unavailable_exception& ex) {
         slogger.debug("Read unavailable: cl={} required {} alive {}", ex.consistency, ex.required, ex.alive);
         get_stats().read_unavailables.mark();
@@ -6186,7 +6201,7 @@ result<::shared_ptr<abstract_read_executor>> storage_proxy::get_read_executor(lw
         get_stats().read_repair_attempts++;
     }
 
-    const size_t block_for = db::block_for(*erm, cl);
+    const size_t block_for = db::block_for(*erm, cl, token);
 
     db::per_partition_rate_limit::info rate_limit_info;
     if (cmd->allow_limit && _db.local().can_apply_per_partition_rate_limit(*schema, db::operation_type::read)) {
@@ -6480,7 +6495,7 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
             dht::partition_range& range = *i;
             host_id_vector_replica_set live_endpoints = get_endpoints_for_reading(*schema, *erm, end_token(range), node_local_only);
             host_id_vector_replica_set merged_preferred_replicas = preferred_replicas_for_range(*i);
-            host_id_vector_replica_set filtered_endpoints = filter_replicas_for_read(cl, *erm, live_endpoints, merged_preferred_replicas, pcf);
+            host_id_vector_replica_set filtered_endpoints = filter_replicas_for_read(cl, *erm, live_endpoints, merged_preferred_replicas, pcf, end_token(range));
             std::vector<dht::token_range> merged_ranges{to_token_range(range)};
             ++i;
 
@@ -6495,7 +6510,7 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
                     const auto current_range_preferred_replicas = preferred_replicas_for_range(*i);
                     dht::partition_range& next_range = *i;
                     host_id_vector_replica_set next_endpoints = get_endpoints_for_reading(*schema, *erm, end_token(next_range), node_local_only);
-                    host_id_vector_replica_set next_filtered_endpoints = filter_replicas_for_read(cl, *erm, next_endpoints, current_range_preferred_replicas, pcf);
+                    host_id_vector_replica_set next_filtered_endpoints = filter_replicas_for_read(cl, *erm, next_endpoints, current_range_preferred_replicas, pcf, end_token(next_range));
 
                     // Origin has this to say here:
                     // *  If the current range right is the min token, we should stop merging because CFS.getRangeSlice
@@ -6536,11 +6551,11 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
                     host_id_vector_replica_set current_merged_preferred_replicas = intersection(merged_preferred_replicas, current_range_preferred_replicas);
 
                     // Check if there is enough endpoint for the merge to be possible.
-                    if (!is_sufficient_live_nodes(cl, *erm, merged)) {
+                    if (!is_sufficient_live_nodes(cl, *erm, merged, end_token(next_range))) {
                         break;
                     }
 
-                    host_id_vector_replica_set filtered_merged = filter_replicas_for_read(cl, *erm, merged, current_merged_preferred_replicas, pcf);
+                    host_id_vector_replica_set filtered_merged = filter_replicas_for_read(cl, *erm, merged, current_merged_preferred_replicas, pcf, end_token(next_range));
 
                     // Estimate whether merging will be a win or not
                     if (filtered_merged.empty()
@@ -6594,7 +6609,7 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
             slogger.trace("creating range read executor for range {} in table {}.{} with targets {}",
                         range, schema->ks_name(), schema->cf_name(), filtered_endpoints);
             try {
-                db::assure_sufficient_live_nodes(cl, *erm, filtered_endpoints, host_id_vector_topology_change{});
+                db::assure_sufficient_live_nodes(cl, *erm, filtered_endpoints, end_token(range), host_id_vector_topology_change{});
             } catch(exceptions::unavailable_exception& ex) {
                 slogger.debug("Read unavailable: cl={} required {} alive {}", ex.consistency, ex.required, ex.alive);
                 get_stats().range_slice_unavailables.mark();
@@ -7155,11 +7170,9 @@ host_id_vector_replica_set storage_proxy::get_endpoints_for_reading(const schema
         return host_id_vector_replica_set{my_host_id(erm)};
     }
     auto endpoints = erm.get_replicas_for_reading(token);
-    // Skip for non-debug builds and maintenance mode.
-    if constexpr (tools::build_info::is_debug_build()) {
-        if (!_maintenance_mode) {
-            validate_read_replicas(erm, endpoints);
-        }
+    // Validate in debug builds only; validate_read_replicas is a no-op otherwise.
+    if (!_maintenance_mode) {
+        validate_read_replicas(erm, endpoints, token);
     }
     auto it = std::ranges::remove_if(endpoints, std::not_fn(std::bind_front(&storage_proxy::is_alive, this, std::cref(erm)))).begin();
     endpoints.erase(it, endpoints.end());
@@ -7176,7 +7189,8 @@ storage_proxy::filter_replicas_for_read(
         const host_id_vector_replica_set& preferred_endpoints,
         db::read_repair_decision repair_decision,
         std::optional<locator::host_id>* extra,
-        replica::column_family* cf) const {
+        replica::column_family* cf,
+        dht::token token_id) const {
     if (live_endpoints.empty() || only_me(erm, live_endpoints)) {
         // `db::filter_for_query` would return the same thing, but thanks to this branch we avoid having
         // to access `remote` - so we can perform local queries without the need of `remote`.
@@ -7185,7 +7199,7 @@ storage_proxy::filter_replicas_for_read(
 
     // There are nodes other than us in `live_endpoints`.
     auto& gossiper = remote().gossiper();
-    return db::filter_for_query(cl, erm, live_endpoints, preferred_endpoints, repair_decision, gossiper, extra, cf);
+    return db::filter_for_query(cl, erm, live_endpoints, preferred_endpoints, repair_decision, gossiper, extra, cf, token_id);
 }
 
 host_id_vector_replica_set
@@ -7194,8 +7208,9 @@ storage_proxy::filter_replicas_for_read(
         const locator::effective_replication_map& erm,
         const host_id_vector_replica_set& live_endpoints,
         const host_id_vector_replica_set& preferred_endpoints,
-        replica::column_family* cf) const {
-    return filter_replicas_for_read(cl, erm, live_endpoints, preferred_endpoints, db::read_repair_decision::NONE, nullptr, cf);
+        replica::column_family* cf,
+        dht::token token_id) const {
+    return filter_replicas_for_read(cl, erm, live_endpoints, preferred_endpoints, db::read_repair_decision::NONE, nullptr, cf, token_id);
 }
 
 bool storage_proxy::is_alive(const locator::effective_replication_map& erm, const locator::host_id& ep) const {
