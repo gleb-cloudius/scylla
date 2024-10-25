@@ -894,6 +894,14 @@ public:
     const locator::resize_decision& resize_decision() const;
     const tablet_task_info& resize_task_info() const;
     const std::optional<locator::repair_scheduler_config> get_repair_scheduler_config() const;
+
+    const tablet_replica_set& get_replicas_for_reading(tablet_id tablet) const;
+
+    const tablet_replica_set& get_replicas_for_writing(tablet_id tablet) const;
+
+    const tablet_replica* get_pending_replica(tablet_id tablet) const;
+
+
 public:
     /// Use only on tablet_map constructed with initialized_later tag to populate its contents.
     /// Must be called for consecutive tablet ids and with increasing last_token.
