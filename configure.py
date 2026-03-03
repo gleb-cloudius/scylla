@@ -383,7 +383,7 @@ modes = {
         'advanced_optimizations': False,
     },
     'release': {
-        'cxxflags': '-ffunction-sections -fdata-sections ',
+        'cxxflags': '-ffunction-sections -fdata-sections -DSCYLLA_ENABLE_ERROR_INJECTION',
         'cxx_ld_flags': '-Wl,--gc-sections',
         'stack-usage-threshold': 1024*13,
         'optimization-level': '3',
