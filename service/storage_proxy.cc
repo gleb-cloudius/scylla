@@ -2169,8 +2169,11 @@ public:
                 size_t total_endpoints_for_dc = std::ranges::count_if(targets, [&topology, &dc] (const locator::host_id& ep){
                     return topology.get_datacenter(ep) == dc;
                 });
-                _dc_responses.emplace(dc, dc_info{0, db::local_quorum_for(*erm, dc, token_id) + pending_for_dc, total_endpoints_for_dc, 0});
-                _total_block_for += pending_for_dc;
+                // Tablet RF is token-aware and already includes transition state;
+                // adding pending replicas here would double-count them.
+                auto effective_pending_for_dc = erm->get_replication_strategy().is_per_table() ? size_t(0) : pending_for_dc;
+                _dc_responses.emplace(dc, dc_info{0, db::local_quorum_for(*erm, dc, token_id) + effective_pending_for_dc, total_endpoints_for_dc, 0});
+                _total_block_for += effective_pending_for_dc;
             }
         }
     }
@@ -3825,9 +3828,15 @@ storage_proxy::create_write_response_handler_helper(schema_ptr s, const dht::tok
     slogger.trace("creating write handler with live: {} dead: {}", live_endpoints, dead_endpoints);
     tracing::trace(tr_state, "Creating write handler with live: {} dead: {}", live_endpoints, dead_endpoints);
 
-    db::assure_sufficient_live_nodes(cl, *erm, live_endpoints, token, pending_endpoints);
+    // Tablet RF is token-aware and already includes transition state. Pending
+    // endpoints are in the target set above, so don't add them again to the CL
+    // requirement for regular writes. Hint replay still passes pending endpoints
+    // through send_to_endpoint() to require acknowledgements from them.
+    const host_id_vector_topology_change empty_pending_endpoints;
+    const auto& effective_pending_endpoints = erm->get_replication_strategy().is_per_table() ? empty_pending_endpoints : pending_endpoints;
+    db::assure_sufficient_live_nodes(cl, *erm, live_endpoints, token, effective_pending_endpoints);
 
-    return make_write_response_handler(std::move(erm), cl, type, std::move(mh), std::move(live_endpoints), pending_endpoints,
+    return make_write_response_handler(std::move(erm), cl, type, std::move(mh), std::move(live_endpoints), effective_pending_endpoints,
             std::move(dead_endpoints), std::move(tr_state), get_stats(), std::move(permit), rate_limit_info, cancellable, token, options.bypass_large_data_guardrails);
 }
 
