@@ -210,6 +210,7 @@ public:
         host_id this_host_id;
         endpoint_dc_rack local_dc_rack;
         bool disable_proximity_sorting = false;
+        bool maintenance_mode = false;
 
         bool operator==(const config&) const = default;
     };

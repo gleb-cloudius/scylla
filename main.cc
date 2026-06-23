@@ -1117,6 +1117,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             tm_cfg.topo_cfg.this_endpoint = broadcast_addr;
             tm_cfg.topo_cfg.this_cql_address = broadcast_rpc_addr;
             tm_cfg.topo_cfg.local_dc_rack = snitch.local()->get_location();
+            tm_cfg.topo_cfg.maintenance_mode = cfg->maintenance_mode();
             if (snitch.local()->get_name() == "org.apache.cassandra.locator.SimpleSnitch") {
                 //
                 // Simple snitch wants sort_by_proximity() not to reorder nodes anyhow

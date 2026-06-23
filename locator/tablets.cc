@@ -1742,6 +1742,18 @@ tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_m
 effective_replication_map_ptr tablet_aware_replication_strategy::do_make_replication_map(
         table_id table, replication_strategy_ptr rs, token_metadata_ptr tm, size_t replication_factor) const {
     tablet_logger.debug("Preparing ERM for table: [{}], topology {}", table,  fmt::ptr(&tm->get_topology()));
+
+    if (tm->get_topology().get_config().maintenance_mode) {
+        // Maintenance mode serves local data only and may not have the full
+        // persisted peer topology available while loading non-system keyspaces.
+        // Avoid resolving tablet replica nodes here; the tablet map is still kept
+        // in token metadata, but DC/RF accounting is irrelevant for local reads.
+        return seastar::make_shared<tablet_effective_replication_map>(
+                table, std::move(rs), std::move(tm), replication_factor,
+                tablet_effective_replication_map::datacenter_to_index_map{},
+                tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_map{});
+    }
+
     auto datacenter_map = build_datacenter_map(tm->get_topology().get_datacenters());
 
     auto replication_factor_map = build_dc_replication_factor_map(tm->tablets().get_tablet_map(table), tm->get_topology(), datacenter_map);
