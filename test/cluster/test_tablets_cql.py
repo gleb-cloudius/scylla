@@ -5,13 +5,18 @@
 #
 import asyncio
 import logging
+import time
 
 import pytest
+from cassandra import ConsistencyLevel, Unavailable
+from cassandra.cluster import NoHostAvailable
 from cassandra.protocol import InvalidRequest
+from cassandra.query import SimpleStatement
 
 from test.pylib.manager_client import ManagerClient
-from test.pylib.rest_client import inject_error_one_shot
-from test.cluster.util import disable_schema_agreement_wait, parse_replication_options, create_new_test_keyspace, \
+from test.pylib.rest_client import inject_error_one_shot, read_barrier
+from test.pylib.util import wait_for
+from test.cluster.util import disable_schema_agreement_wait, create_new_test_keyspace, \
     new_test_keyspace, get_replication
 
 logger = logging.getLogger(__name__)
@@ -125,3 +130,100 @@ async def test_alter_tablets_keyspace_concurrent_modification(manager: ManagerCl
         assert get_replication(manager.get_cql(), ks)[this_dc] == ['r1', 'r2']
 
         await manager.get_cql().run_async(f"drop keyspace {ks2}")
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_rf_increase_1_to_2_local_quorum_unavailable_during_transition(manager: ManagerClient) -> None:
+    config = {
+        'tablets_mode_for_new_keyspaces': 'enabled'
+    }
+    cmdline = [
+        '--logger-log-level', 'storage_proxy=trace',
+    ]
+
+    this_dc = "dc1"
+    logger.info("starting a node (the leader)")
+    servers = [await manager.server_add(config=config, cmdline=cmdline, property_file={"dc": this_dc, "rack": "r1"})]
+
+    logger.info("starting a second node (the follower)")
+    servers += [await manager.server_add(config=config, cmdline=cmdline, property_file={"dc": this_dc, "rack": "r2"})]
+
+    await manager.get_ready_cql(servers)
+
+    async with new_test_keyspace(manager, "with replication = {'class': 'NetworkTopologyStrategy', "
+                                          f"'{this_dc}': ['r1']"
+                                          "} and tablets = {'initial': 1}") as ks:
+        cql = manager.get_cql()
+        await cql.run_async(f"create table {ks}.t (pk int primary key, v int)")
+        await cql.run_async(f"insert into {ks}.t (pk, v) values (0, 0)")
+
+        logger.info(f"injecting stream_mutation_fragments into the destination node {servers[1]}")
+        injection_handler = await inject_error_one_shot(manager.api, servers[1].ip_addr, 'stream_mutation_fragments')
+
+        select_lq = SimpleStatement(f"select v from {ks}.t where pk = 0", consistency_level=ConsistencyLevel.LOCAL_QUORUM)
+        stop_event = asyncio.Event()
+        stats = {
+            'successes': 0,
+            'failures': 0,
+        }
+
+        async def run_local_quorum_workload() -> None:
+            i = 1
+            while not stop_event.is_set():
+                insert_lq = SimpleStatement(
+                    f"insert into {ks}.t (pk, v) values ({i}, {i})",
+                    consistency_level=ConsistencyLevel.LOCAL_QUORUM,
+                )
+                try:
+                    await cql.run_async(insert_lq)
+                    await cql.run_async(select_lq)
+                    stats['successes'] += 1
+                except (Unavailable, NoHostAvailable):
+                    stats['failures'] += 1
+                    pass
+                i += 1
+                await asyncio.sleep(0.01)
+
+
+        async def alter_tablets_ks_without_waiting_to_complete() -> None:
+            logger.info("scheduling ALTER KS to change the RF from 1 to 2")
+            await cql.run_async(
+                f"alter keyspace {ks} with replication = "
+                f"{{'class': 'NetworkTopologyStrategy', '{this_dc}': ['r1','r2']}}"
+            )
+
+        task = asyncio.create_task(alter_tablets_ks_without_waiting_to_complete())
+
+        logger.info(f"waiting for the destination node {servers[1]} to block streaming during rebuild")
+        destination_log_file = await manager.server_open_log(servers[1].server_id)
+        await destination_log_file.wait_for("stream_mutation_fragments: waiting", timeout=30)
+        # do raft read barrier
+        await read_barrier(manager.api, servers[0].ip_addr)
+        await read_barrier(manager.api, servers[1].ip_addr)
+        workload_task = asyncio.create_task(run_local_quorum_workload())
+
+        async def pending_window_has_failures():
+            return stats['failures'] if stats['failures'] > 0 else None
+
+        # The workload runs concurrently with ALTER; once rebuild starts and is blocked,
+        # LOCAL_QUORUM should be temporarily unavailable because one replica is pending.
+        try:
+            await wait_for(lambda: pending_window_has_failures(), time.time() + 20)
+        except Exception:
+            pass
+
+        logger.info("waking up the destination node to let rebuild finish")
+        await injection_handler.message()
+        await task
+
+        stop_event.set()
+        await workload_task
+
+        assert stats['successes'] > 0
+        assert stats['failures'] == 0
+
+        assert get_replication(cql, ks)[this_dc] == ['r1', 'r2']
+
+        # Sanity check that the same CL works again once transition has finished.
+        await cql.run_async(select_lq)
+        await cql.run_async(SimpleStatement(f"insert into {ks}.t (pk, v) values (1, 1)", consistency_level=ConsistencyLevel.LOCAL_QUORUM))
