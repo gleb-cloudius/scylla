@@ -1712,7 +1712,7 @@ namespace {
 // and counts replicas per data center.  Each data center's replication factor (RF) is saved under
 // its index according to the `datacenter_map`.
 tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_map build_dc_replication_factor_map(const tablet_map& tablets,
-        const topology& topo, const tablet_effective_replication_map::datacenter_to_index_map& datacenter_map) {
+        const topology& topo, const tablet_effective_replication_map::datacenter_to_index_map& datacenter_map, bool ignore_missing_nodes = false) {
     tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_map tablet_to_dc_replication_factor_map;
     tablet_to_dc_replication_factor_map.reserve(tablets.tablet_count());
     for (size_t tablet_index = 0; tablet_index < tablets.tablet_count(); ++tablet_index) {
@@ -1722,11 +1722,19 @@ tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_m
         for (const auto& node : replicas) {
             const locator::node* node_ptr = topo.find_node(node.host);
             if (node_ptr == nullptr) {
+                if (ignore_missing_nodes) {
+                    tablet_logger.debug("Ignoring tablet replica {} missing from topology while building tablet RF map", node);
+                    continue;
+                }
                 on_internal_error(tablet_logger, format("Could not find node: {} in topology.", node));
             }
             const sstring& datacenter = topo.get_datacenter(node.host);
             const auto it = datacenter_map.find(datacenter);
             if (it == datacenter_map.end()) {
+                if (ignore_missing_nodes) {
+                    tablet_logger.debug("Ignoring tablet replica {} in datacenter {} missing from datacenter map while building tablet RF map", node, datacenter);
+                    continue;
+                }
                 on_internal_error(tablet_logger, format("Could not find datacenter: {} for node: {} ", datacenter, node));
             }
             const auto index = it->second;
@@ -1748,15 +1756,21 @@ effective_replication_map_ptr tablet_aware_replication_strategy::do_make_replica
         // persisted peer topology available while loading non-system keyspaces.
         // Avoid resolving tablet replica nodes here; the tablet map is still kept
         // in token metadata, but DC/RF accounting is irrelevant for local reads.
+        tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_map replication_factor_map;
+        replication_factor_map.reserve(tm->tablets().get_tablet_map(table).tablet_count());
+        for (size_t tablet_index = 0; tablet_index < tm->tablets().get_tablet_map(table).tablet_count(); ++tablet_index) {
+            replication_factor_map.emplace_back();
+        }
         return seastar::make_shared<tablet_effective_replication_map>(
                 table, std::move(rs), std::move(tm), replication_factor,
                 tablet_effective_replication_map::datacenter_to_index_map{},
-                tablet_effective_replication_map::tablet_to_datacenter_replication_factor_list_map{});
+                std::move(replication_factor_map));
     }
 
     auto datacenter_map = build_datacenter_map(tm->get_topology().get_datacenters());
 
-    auto replication_factor_map = build_dc_replication_factor_map(tm->tablets().get_tablet_map(table), tm->get_topology(), datacenter_map);
+    auto replication_factor_map = build_dc_replication_factor_map(tm->tablets().get_tablet_map(table), tm->get_topology(), datacenter_map,
+            tm->get_topology().get_config().recovery_mode);
 
     auto erm = seastar::make_shared<tablet_effective_replication_map>(
             table, std::move(rs), std::move(tm), replication_factor, std::move(datacenter_map), std::move(replication_factor_map));
