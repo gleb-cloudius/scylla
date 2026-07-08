@@ -67,6 +67,21 @@ public:
         // Helps distinguish raft instances when multiple groups share the
         // same server_id. If empty, server_id is used as the default.
         sstring tag;
+
+        // LeaseGuard leader leases. When set, the leader serves linearizable
+        // reads locally (no quorum round-trip) while its lease is valid, and
+        // defers committing writes until a deposed leader's lease has expired.
+        // Requires a bounded-uncertainty clock; see raft/bounded_clock.hh.
+        struct leaseguard_configuration {
+            // Lease duration (Δ). Should be on the order of the election
+            // timeout.
+            std::chrono::system_clock::duration delta;
+            // Clock providing bounded-uncertainty time readings. The caller owns
+            // it and must keep it alive for the lifetime of the server. See
+            // raft/bounded_clock.hh.
+            bounded_clock& clock;
+        };
+        std::optional<leaseguard_configuration> leaseguard;
     };
 
     virtual ~server() {}
